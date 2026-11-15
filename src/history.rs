@@ -99,8 +99,14 @@ impl History {
         }
     }
 
-    pub fn flush(&mut self) {}
-
+    pub fn flush(&mut self) {
+        if let Some(p) = &self.path {
+            // Ensure buffered/queued writes reach disk.
+            if let Ok(f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
+                let _ = f.sync_all();
+            }
+        }
+    }
     /// Most recent entry starting with `prefix`, preferring ones run in `cwd`.
     pub fn suggest(&self, prefix: &str, cwd: &str) -> Option<&str> {
         let mut fallback = None;

@@ -371,6 +371,7 @@ fn main() {
             }
         }
     }
+    sh.login = login;
     let rest = &args[i.min(args.len())..];
 
     if let Some(cmd) = command {

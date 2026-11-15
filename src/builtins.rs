@@ -7,7 +7,7 @@ use crate::sys;
 use std::rc::Rc;
 
 pub const BUILTINS: &[&str] = &[
-    ".", ":", "[", "alias", "bg", "break", "builtin", "cd", "command", "complete", "continue", "declare", "defer", "dirs", "disown", "echo", "eval", "exec", "exit", "export", "false", "fg", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "return", "set", "setopt", "shift", "shopt", "source", "test", "trap", "true", "type", "typeset", "umask", "unalias", "unset", "unsetopt", "wait", "which", "z",
+    ".", ":", "[", "abbr", "alias", "bg", "break", "builtin", "cd", "command", "complete", "contains", "continue", "count", "declare", "defer", "dirs", "disown", "echo", "eval", "exec", "exit", "export", "false", "fg", "functions", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "mapfile", "math", "path", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "realpath", "return", "set", "set_color", "setopt", "shift", "shopt", "source", "status", "string", "test", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait", "which", "z",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -958,6 +958,251 @@ impl Shell {
                 Ok(0)
             }
             "z" => self.builtin_z(args),
+            "abbr" => {
+                // fish-style abbreviations, mapped onto nash aliases.
+                let mut erase = false;
+                let mut i = 0;
+                while i < args.len() && args[i].starts_with('-') {
+                    match args[i].as_str() {
+                        "-e" | "--erase" => erase = true,
+                        "-a" | "--add" => {}
+                        "--" => { i += 1; break; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let rest = &args[i..];
+                if erase {
+                    for n in rest {
+                        Rc::make_mut(&mut self.aliases).remove(n);
+                    }
+                    return Ok(0);
+                }
+                if rest.len() < 2 {
+                    sherr!("abbr: usage: abbr name expansion");
+                    return Ok(2);
+                }
+                let name = rest[0].clone();
+                let expansion = rest[1..].join(" ");
+                Rc::make_mut(&mut self.aliases).insert(name, expansion);
+                Ok(0)
+            }
+            "contains" => {
+                let mut print_index = false;
+                let mut i = 0;
+                while i < args.len() && args[i].starts_with('-') {
+                    match args[i].as_str() {
+                        "-i" | "--index" => print_index = true,
+                        "--" => { i += 1; break; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let rest = &args[i..];
+                if rest.len() < 2 {
+                    sherr!("contains: usage: contains needle haystack...");
+                    return Ok(2);
+                }
+                let needle = &rest[0];
+                for (j, v) in rest[1..].iter().enumerate() {
+                    if v == needle {
+                        if print_index {
+                            out!("{}\n", j + 1);
+                        }
+                        return Ok(0);
+                    }
+                }
+                Ok(1)
+            }
+            "count" => {
+                let mut n = args.len();
+                if !sys::isatty(0) {
+                    let data = sys::read_all(0);
+                    n += data.iter().filter(|b| **b == b'\n').count();
+                }
+                out!("{}\n", n);
+                Ok(if n == 0 { 1 } else { 0 })
+            }
+            "functions" => {
+                if args.is_empty() {
+                    let mut names: Vec<&String> = self.funcs.keys().collect();
+                    names.sort();
+                    for n in names {
+                        out!("{}\n", n);
+                    }
+                    return Ok(0);
+                }
+                let mut i = 0;
+                let mut erase = false;
+                let mut query = false;
+                while i < args.len() && args[i].starts_with('-') {
+                    match args[i].as_str() {
+                        "-e" | "--erase" => erase = true,
+                        "-q" | "--query" => query = true,
+                        "--" => { i += 1; break; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let names = &args[i..];
+                if query {
+                    let n = names.first().cloned().unwrap_or_default();
+                    return Ok(if self.funcs.contains_key(&n) { 0 } else { 1 });
+                }
+                if erase {
+                    for n in names {
+                        self.funcs.remove(n);
+                    }
+                    return Ok(0);
+                }
+                if let Some(n) = names.first() {
+                    if let Some(f) = self.funcs.get(n).cloned() {
+                        if !f.text.is_empty() {
+                            out!("{}\n", f.text);
+                        } else {
+                            out!("function {}\\n    (body)\\nend\\n", n);
+                        }
+                        return Ok(0);
+                    }
+                    return Ok(1);
+                }
+                Ok(0)
+            }
+            "math" => {
+                let expr = args.join(" ");
+                if expr.is_empty() {
+                    sherr!("math: missing expression");
+                    return Ok(2);
+                }
+                match self.arith(&expr) {
+                    Ok(n) => {
+                        out!("{}\n", n.fmt());
+                        Ok(0)
+                    }
+                    Err(_) => Ok(1),
+                }
+            }
+            "path" => self.builtin_path(args),
+            "realpath" => {
+                let mut require = false;
+                let mut logical = false;
+                let mut paths = Vec::new();
+                for a in args {
+                    match a.as_str() {
+                        "-e" | "--canonicalize-existing" => require = true,
+                        "-m" | "--canonicalize-missing" => logical = true,
+                        "--" => {}
+                        a if a.starts_with('-') => {}
+                        _ => paths.push(a.clone()),
+                    }
+                }
+                if paths.is_empty() {
+                    sherr!("realpath: missing operand");
+                    return Ok(1);
+                }
+                let mut st = 0;
+                for p in paths {
+                    let resolved = if logical {
+                        // lexical normalisation
+                        let base = if p.starts_with('/') { String::new() } else { self.cwd() };
+                        let mut comps: Vec<String> = Vec::new();
+                        for part in format!("{}/{}", base, p).split('/') {
+                            match part {
+                                "" | "." => {}
+                                ".." => { comps.pop(); }
+                                c => comps.push(c.to_string()),
+                            }
+                        }
+                        format!("/{}", comps.join("/"))
+                    } else {
+                        match std::fs::canonicalize(&p) {
+                            Ok(pb) => pb.to_string_lossy().into_owned(),
+                            Err(_) => {
+                                if require {
+                                    sherr!("realpath: {}: No such file or directory", p);
+                                    st = 1;
+                                    continue;
+                                }
+                                // fall back to lexical
+                                let base = if p.starts_with('/') { String::new() } else { self.cwd() };
+                                let mut comps: Vec<String> = Vec::new();
+                                for part in format!("{}/{}", base, p).split('/') {
+                                    match part {
+                                        "" | "." => {}
+                                        ".." => { comps.pop(); }
+                                        c => comps.push(c.to_string()),
+                                    }
+                                }
+                                format!("/{}", comps.join("/"))
+                            }
+                        }
+                    };
+                    out!("{}\n", resolved);
+                }
+                Ok(st)
+            }
+            "set_color" => {
+                // fish-style: set_color [options] color
+                let mut bg = false;
+                let mut bold = false;
+                let mut color = None;
+                for a in args {
+                    match a.as_str() {
+                        "-b" => bg = true,
+                        "-o" | "--bold" => bold = true,
+                        "--background" => bg = true,
+                        c => color = Some(c.to_string()),
+                    }
+                }
+                let code = match color.as_deref() {
+                    Some("normal") | None => "0".to_string(),
+                    Some("black") => "30".to_string(),
+                    Some("red") => "31".to_string(),
+                    Some("green") => "32".to_string(),
+                    Some("yellow") => "33".to_string(),
+                    Some("blue") => "34".to_string(),
+                    Some("magenta") => "35".to_string(),
+                    Some("cyan") => "36".to_string(),
+                    Some("white") => "37".to_string(),
+                    Some(c) if c.chars().all(|x| x.is_ascii_digit()) => {
+                        let n: u8 = c.parse().unwrap_or(7);
+                        if bg { format!("48;5;{}", n) } else { format!("38;5;{}", n) }
+                    }
+                    Some(_) => "0".to_string(),
+                };
+                let mut seq = String::from("\x1b[");
+                if bg {
+                    // background color already encoded
+                }
+                if bold {
+                    seq.push_str("1;");
+                }
+                seq.push_str(&code);
+                seq.push('m');
+                out!("{}", seq);
+                Ok(0)
+            }
+            "status" => {
+                if args.is_empty() {
+                    out!("{}\n", self.last_status);
+                    return Ok(0);
+                }
+                match args[0].as_str() {
+                    "is-interactive" => Ok(if self.interactive { 0 } else { 1 }),
+                    "is-login" => Ok(if self.login { 0 } else { 1 }),
+                    "current-command" | "current-filename" => {
+                        out!("{}\n", self.script_name);
+                        Ok(0)
+                    }
+                    "job-control" => Ok(if self.job_control { 0 } else { 1 }),
+                    _ => {
+                        sherr!("status: unknown subcommand `{}'", args[0]);
+                        Ok(1)
+                    }
+                }
+            }
+            "string" => self.builtin_string(args),
+            "ulimit" => self.builtin_ulimit(args),
             "help" => {
                 out!("{}\n", HELP);
                 let mut line = String::from(" ");
@@ -2050,5 +2295,482 @@ impl Shell {
                 Ok(1)
             }
         }
+    }
+
+    fn builtin_path(&mut self, args: &[String]) -> R {
+        if args.is_empty() {
+            if !sys::isatty(0) {
+                let data = sys::read_all(0);
+                let s = String::from_utf8_lossy(&data);
+                for line in s.lines() {
+                    out!("{}\n", line);
+                }
+            }
+            return Ok(0);
+        }
+        let sub = args[0].as_str();
+        match sub {
+            "basename" | "dirname" | "extension" | "normalize" | "realpath" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for p in inputs {
+                    match sub {
+                        "basename" => {
+                            out!("{}\n", p.rsplit('/').next().unwrap_or("").trim_end_matches('/'));
+                        }
+                        "dirname" => {
+                            let t = p.trim_end_matches('/');
+                            match t.rfind('/') {
+                                Some(i) if i > 0 => { out!("{}\n", &t[..i]); }
+                                _ => { out!(".\n"); }
+                            }
+                        }
+                        "extension" => {
+                            let base = p.rsplit('/').next().unwrap_or("");
+                            match base.rfind('.') {
+                                Some(i) if i > 0 => { out!("{}\n", &base[i..]); }
+                                _ => { out!("\n"); }
+                            }
+                        }
+                        "normalize" | "realpath" => {
+                            let base = if p.starts_with('/') { String::new() } else { self.cwd() };
+                            let mut comps: Vec<String> = Vec::new();
+                            for part in format!("{}/{}", base, p).split('/') {
+                                match part {
+                                    "" | "." => {}
+                                    ".." => { comps.pop(); }
+                                    c => comps.push(c.to_string()),
+                                }
+                            }
+                            out!("/{}\n", comps.join("/"));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(0)
+            }
+            "change-extension" | "change_extension" => {
+                let ext = args.get(1).cloned().unwrap_or_default();
+                let rest = if args.len() > 2 { &args[2..] } else { &[] as &[String] };
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for p in inputs {
+                    let (dir, base) = match p.rfind('/') {
+                        Some(i) => (&p[..=i], &p[i + 1..]),
+                        None => ("", p.as_str()),
+                    };
+                    let stem = match base.rfind('.') {
+                        Some(i) if i > 0 => &base[..i],
+                        _ => base,
+                    };
+                    let newbase = if ext.is_empty() { stem.to_string() } else { format!("{}.{}", stem, ext.trim_start_matches('.')) };
+                    out!("{}{}\n", dir, newbase);
+                }
+                Ok(0)
+            }
+            "is-dir" | "is_dir" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for p in inputs {
+                    if sys::is_dir(&p) { return Ok(0); }
+                }
+                Ok(1)
+            }
+            "filter" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for p in inputs {
+                    out!("{}\n", p);
+                }
+                Ok(0)
+            }
+            other => {
+                // treat whole args as paths to print (fish `path` with no subcommand)
+                for p in args {
+                    out!("{}\n", p);
+                }
+                let _ = other;
+                Ok(0)
+            }
+        }
+    }
+
+    fn builtin_string(&mut self, args: &[String]) -> R {
+        if args.is_empty() {
+            if !sys::isatty(0) {
+                let data = sys::read_all(0);
+                sys::write_fd(1, &data);
+            }
+            return Ok(0);
+        }
+        let sub = args[0].as_str();
+        match sub {
+            "length" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    out!("{}\n", s.chars().count());
+                }
+                Ok(0)
+            }
+            "upper" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    out!("{}\n", s.to_uppercase());
+                }
+                Ok(0)
+            }
+            "lower" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    out!("{}\n", s.to_lowercase());
+                }
+                Ok(0)
+            }
+            "trim" => {
+                let mut left = true;
+                let mut right = true;
+                let mut chars: Option<String> = None;
+                let mut i = 1;
+                while i < args.len() && args[i].starts_with('-') {
+                    match args[i].as_str() {
+                        "-l" => { right = false; }
+                        "-r" => { left = false; }
+                        "-c" => {
+                            i += 1;
+                            chars = args.get(i).cloned();
+                        }
+                        "--" => { i += 1; break; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let rest = &args[i..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    let mut t = s.clone();
+                    let trimset = chars.clone().unwrap_or_else(|| " \t".to_string());
+                    if left {
+                        t = t.trim_start_matches(|c: char| trimset.contains(c)).to_string();
+                    }
+                    if right {
+                        t = t.trim_end_matches(|c: char| trimset.contains(c)).to_string();
+                    }
+                    out!("{}\n", t);
+                }
+                Ok(0)
+            }
+            "replace" => {
+                let mut all = false;
+                let mut i = 1;
+                while i < args.len() && args[i].starts_with('-') {
+                    if args[i] == "-a" || args[i] == "--all" { all = true; }
+                    if args[i] == "--" { i += 1; break; }
+                    i += 1;
+                }
+                if i + 2 > args.len() {
+                    sherr!("string replace: usage: string replace [-a] pattern replacement [strings...]");
+                    return Ok(2);
+                }
+                let pat = &args[i];
+                let rep = &args[i + 1];
+                let rest = &args[i + 2..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    let outstr = if all {
+                        s.replace(pat, rep)
+                    } else {
+                        // replace first occurrence
+                        if let Some(pos) = s.find(pat) {
+                            let mut r = String::new();
+                            r.push_str(&s[..pos]);
+                            r.push_str(rep);
+                            r.push_str(&s[pos + pat.len()..]);
+                            r
+                        } else {
+                            s.clone()
+                        }
+                    };
+                    out!("{}\n", outstr);
+                }
+                Ok(0)
+            }
+            "split" => {
+                let mut max: Option<usize> = None;
+                let mut i = 1;
+                while i < args.len() && args[i].starts_with('-') {
+                    if args[i] == "-n" || args[i] == "--max" {
+                        i += 1;
+                        max = args.get(i).and_then(|s| s.parse().ok());
+                    }
+                    if args[i] == "--" { i += 1; break; }
+                    i += 1;
+                }
+                if i >= args.len() {
+                    sherr!("string split: missing separator");
+                    return Ok(2);
+                }
+                let sep = &args[i];
+                let rest = &args[i + 1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    let parts: Vec<String> = if sep.is_empty() {
+                        s.chars().map(|_| String::new()).collect()
+                    } else {
+                        s.split(sep).map(|x| x.to_string()).collect()
+                    };
+                    let parts = if let Some(m) = max {
+                        // join tail
+                        if parts.len() > m {
+                            let mut v: Vec<String> = parts[..m - 1].iter().map(|x| x.to_string()).collect();
+                            v.push(parts[m - 1..].join(sep));
+                            v
+                        } else {
+                            parts
+                        }
+                    } else {
+                        parts
+                    };
+                    for p in parts {
+                        out!("{}\n", p);
+                    }
+                }
+                Ok(0)
+            }
+            "join" => {
+                let sep = args.get(1).cloned().unwrap_or_default();
+                let rest = &args[2..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                out!("{}\n", inputs.join(&sep));
+                Ok(0)
+            }
+            "sub" => {
+                let mut start: isize = 1;
+                let mut length: Option<usize> = None;
+                let mut i = 1;
+                while i < args.len() && args[i].starts_with('-') {
+                    if args[i] == "-s" || args[i] == "--start" {
+                        i += 1;
+                        start = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+                    } else if args[i] == "-l" || args[i] == "--length" {
+                        i += 1;
+                        length = args.get(i).and_then(|s| s.parse().ok());
+                    }
+                    if args[i] == "--" { i += 1; break; }
+                    i += 1;
+                }
+                let rest = &args[i..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                for s in inputs {
+                    let chars: Vec<char> = s.chars().collect();
+                    let n = chars.len() as isize;
+                    let mut st = if start < 0 { (n + start).max(0) as usize } else { (start - 1).max(0) as usize };
+                    if st > chars.len() { st = chars.len(); }
+                    let end = match length {
+                        Some(l) => (st + l).min(chars.len()),
+                        None => chars.len(),
+                    };
+                    let outstr: String = chars[st..end].iter().collect();
+                    out!("{}\n", outstr);
+                }
+                Ok(0)
+            }
+            "match" => {
+                let pat = args.get(1).cloned().unwrap_or_default();
+                let rest = &args[2..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                // simple glob match
+                for s in inputs {
+                    if crate::glob::matches(&pat, &s) {
+                        out!("{}\n", s);
+                    }
+                }
+                Ok(0)
+            }
+            "collect" => {
+                let rest = &args[1..];
+                let inputs = if rest.is_empty() && !sys::isatty(0) {
+                    String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
+                } else {
+                    rest.to_vec()
+                };
+                out!("{}\n", inputs.join(""));
+                Ok(0)
+            }
+            other => {
+                sherr!("string: unknown subcommand `{}'", other);
+                Ok(1)
+            }
+        }
+    }
+
+    fn builtin_ulimit(&mut self, args: &[String]) -> R {
+        use libc::{RLIM_INFINITY, rlimit};
+        #[derive(Clone, Copy)]
+        struct Res { flag: char, name: &'static str, res: i32 }
+        let mut resources: Vec<Res> = Vec::new();
+        macro_rules! add {
+            ($flag:expr, $name:expr, $r:expr) => {
+                resources.push(Res { flag: $flag, name: $name, res: $r });
+            };
+        }
+        add!('c', "core file size", libc::RLIMIT_CORE);
+        add!('d', "data seg size", libc::RLIMIT_DATA);
+        add!('f', "file size", libc::RLIMIT_FSIZE);
+        add!('l', "max locked memory", libc::RLIMIT_MEMLOCK);
+        add!('m', "max memory size", libc::RLIMIT_RSS);
+        add!('n', "open files", libc::RLIMIT_NOFILE);
+        add!('s', "stack size", libc::RLIMIT_STACK);
+        add!('t', "cpu time", libc::RLIMIT_CPU);
+        add!('u', "max user processes", libc::RLIMIT_NPROC);
+        add!('v', "virtual memory", libc::RLIMIT_AS);
+        // parse
+        let mut hard_flag = false;
+        let mut soft_flag = false;
+        let mut all = false;
+        let mut chosen: Option<char> = None;
+        let mut value: Option<String> = None;
+        for a in args {
+            if a.starts_with('-') && a.len() > 1 && a != "--" {
+                for c in a[1..].chars() {
+                    match c {
+                        'H' => hard_flag = true,
+                        'S' => soft_flag = true,
+                        'a' => all = true,
+                        'c' | 'd' | 'f' | 'l' | 'm' | 'n' | 's' | 't' | 'u' | 'v' => chosen = Some(c),
+                        _ => {}
+                    }
+                }
+            } else {
+                value = Some(a.clone());
+            }
+        }
+        let hard = if hard_flag && !soft_flag { true } else { hard_flag };
+        let soft = if !hard_flag && !soft_flag { true } else { soft_flag };
+        let set_both = !hard_flag && !soft_flag;
+        let hard = if set_both { true } else { hard };
+        let soft = if set_both { true } else { soft };
+        if all {
+            for r in &resources {
+                if r.res < 0 { continue; }
+                unsafe {
+                    let mut rl: rlimit = std::mem::zeroed();
+                    if libc::getrlimit(r.res as _, &mut rl) == 0 {
+                        let fmt = |x: libc::rlim_t| if x == RLIM_INFINITY { "unlimited".to_string() } else { x.to_string() };
+                        out!("{:<24} {}\n", r.name, fmt(rl.rlim_cur));
+                    }
+                }
+            }
+            return Ok(0);
+        }
+        let flag = chosen.unwrap_or('f');
+        let res = match resources.iter().find(|r| r.flag == flag) {
+            Some(r) => r.res,
+            None => {
+                sherr!("ulimit: invalid option");
+                return Ok(1);
+            }
+        };
+        if res < 0 {
+            sherr!("ulimit: not supported on this system");
+            return Ok(1);
+        }
+        if value.is_none() {
+            unsafe {
+                let mut rl: rlimit = std::mem::zeroed();
+                if libc::getrlimit(res as _, &mut rl) != 0 {
+                    return Ok(1);
+                }
+                let v = if hard_flag && !soft_flag { rl.rlim_max } else { rl.rlim_cur };
+                if v == RLIM_INFINITY {
+                    out!("unlimited\n");
+                } else {
+                    out!("{}\n", v);
+                }
+            }
+            return Ok(0);
+        }
+        let val_str = value.unwrap();
+        let new = if val_str == "unlimited" {
+            RLIM_INFINITY
+        } else {
+            match val_str.parse::<libc::rlim_t>() {
+                Ok(n) => n,
+                Err(_) => {
+                    sherr!("ulimit: invalid number");
+                    return Ok(1);
+                }
+            }
+        };
+        unsafe {
+            let mut rl: rlimit = std::mem::zeroed();
+            if libc::getrlimit(res as _, &mut rl) != 0 {
+                return Ok(1);
+            }
+            if soft {
+                rl.rlim_cur = new;
+            }
+            if hard {
+                rl.rlim_max = new;
+            }
+            if libc::setrlimit(res as _, &rl) != 0 {
+                sherr!("ulimit: {}", sys::last_error());
+                return Ok(1);
+            }
+        }
+        Ok(0)
     }
 }
