@@ -89,7 +89,7 @@ jobs:
       - name: Write VERSION and SHA256SUMS
         working-directory: dist
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -n 1)
           echo "$version" > VERSION
           sha256sum nash-* > SHA256SUMS
           cat VERSION
