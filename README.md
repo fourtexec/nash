@@ -81,9 +81,12 @@ nash. As with `install`, run a script called `update` as `nash ./update`.
 
 Releases are made by the workflow in `.github/workflows/release.yml`: every
 push to `main` is a development build tagged `dev1`, `dev2`, `dev3`, ..., and
-pushing a tag `v1.2.3` publishes the stable release `1.2.3`. A workflow of the
-site repository then lists the new release in the manifest, twice an hour or at
-once if the `SITE_DISPATCH_TOKEN` secret is set here.
+pushing a tag `v1.2.3` publishes the stable release `1.2.3`. The same workflow
+then updates [fourtexec.site](https://fourtexec.site): the manifest and the nash
+project page with the newest releases and changes. That step needs the
+`SITE_TOKEN` secret (a fine-grained token with "Contents: read and write" on
+`fourtexec/fourtexec.github.io`); without it the site notices the release by
+itself within half an hour.
 
 ## What you get
 
