@@ -80,10 +80,7 @@ pub fn install(args: &[String]) -> i32 {
         err!("nash install: cannot create {}: {}\n", bindir, e);
         return 1;
     }
-    let same = std::fs::canonicalize(&dest).map(|d| d == src).unwrap_or(false);
-    if same {
-        out!("nash is already installed at {}\n", dest);
-    } else {
+    {
         // copy next to the target and rename, so a running nash is never truncated
         let tmp = format!("{}.new{}", dest, std::process::id());
         let r = std::fs::copy(&src, &tmp).and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))).and_then(|_| std::fs::rename(&tmp, &dest));
@@ -133,10 +130,6 @@ pub fn install(args: &[String]) -> i32 {
             std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
         }
     };
-    if current == dest {
-        out!("nash is already your login shell\n");
-        return 0;
-    }
     let ok = if has("chsh") {
         if root {
             run("chsh", &["-s", &dest, &user])
