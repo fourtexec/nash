@@ -311,26 +311,7 @@ fn map_pv(v: PV, f: impl Fn(&str) -> String) -> PV {
 }
 
 pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "_-./=:,+@%^".contains(c)) {
-        return s.to_string();
-    }
-    if s.chars().any(|c| c.is_control()) {
-        let mut out = String::from("$'");
-        for c in s.chars() {
-            match c {
-                '\n' => out.push_str("\\n"),
-                '\t' => out.push_str("\\t"),
-                '\r' => out.push_str("\\r"),
-                '\x1b' => out.push_str("\\e"),
-                '\'' => out.push_str("\\'"),
-                '\\' => out.push_str("\\\\"),
-                c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out.push('\'');
-        return out;
-    }
+    // Always quote for alias output compatibility with bash
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

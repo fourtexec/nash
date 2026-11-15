@@ -181,8 +181,18 @@ fn binop(op: &str, a: Num, b: Num) -> Result<Num, String> {
         "|" => return Ok(Num::I(a.as_i() | b.as_i())),
         "^" => return Ok(Num::I(a.as_i() ^ b.as_i())),
         "&" => return Ok(Num::I(a.as_i() & b.as_i())),
-        "<<" => return Ok(Num::I(a.as_i().wrapping_shl(b.as_i() as u32))),
-        ">>" => return Ok(Num::I(a.as_i().wrapping_shr(b.as_i() as u32))),
+        "<<" => {
+            if b.as_i() < 0 {
+                return Err("negative shift".into());
+            }
+            return Ok(Num::I(a.as_i().wrapping_shl(b.as_i() as u32)));
+        }
+        ">>" => {
+            if b.as_i() < 0 {
+                return Err("negative shift".into());
+            }
+            return Ok(Num::I(a.as_i().wrapping_shr(b.as_i() as u32)));
+        }
         _ => {}
     }
     if float {
@@ -210,10 +220,9 @@ fn binop(op: &str, a: Num, b: Num) -> Result<Num, String> {
         }
         "**" => {
             if y < 0 {
-                Num::F((x as f64).powf(y as f64))
-            } else {
-                Num::I(x.wrapping_pow(y as u32))
+                return Err("negative exponent".into());
             }
+            Num::I(x.wrapping_pow(y as u32))
         }
         _ => return Err(format!("bad operator {}", op)),
     })

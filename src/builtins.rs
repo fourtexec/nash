@@ -741,6 +741,10 @@ impl Shell {
                 Ok(st)
             }
             "unalias" => {
+                if args.is_empty() {
+                    sherr!("unalias: usage: unalias name...");
+                    return Ok(2);
+                }
                 let mut st = 0;
                 for a in args {
                     if a == "-a" {
