@@ -182,12 +182,15 @@ and exit status. Autosuggestions prefer commands you ran in the *current*
 directory, so the grey text after your cursor is usually what you want —
 press → or End to accept it, Alt-F to accept one word.
 
-**The prompt.** With no `PS1` set you get the directory, git branch, running
-jobs, duration of slow commands and the exit status of failed ones. Custom
-prompts can use bash escapes plus `\g` (git branch), `\?` (exit status),
-`\P` (pipeline statuses, e.g. `1|0`), and `\L` (duration of the last command),
-and `RPROMPT` for the right-hand side. The git branch lookup is cached per
-directory, so it stays cheap even in deep trees.
+**The prompt.** `PS1` is a normal shell variable. Its default is
+`\U\C\G\J\M\Q\Z`: `\U` SSH `user@host`, `\C` styled cwd, `\G` git branch,
+`\J` running jobs, `\M` duration of slow commands, `\Q` failed exit status,
+`\Z` the colored symbol. Edit `PS1` to reorder or drop segments, or mix in bash
+escapes (`\u \h \w \W \$ \t …`) plus `\g` (plain git branch), `\?`, `\P`
+(pipeline statuses, e.g. `1|0`) and `\L` (duration). `RPROMPT` sets the
+right-hand side. The prompt is compiled once and recompiled only when the
+string changes; git lookups are cached per directory, so it stays cheap even in
+deep trees. `unset PS1` restores the default; `PS1=''` gives an empty prompt.
 
 ## Line editor keys
 

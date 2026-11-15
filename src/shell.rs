@@ -184,6 +184,9 @@ pub struct Shell {
     home_dir: Option<String>,
     /// Lazily resolved username (resolved on first access to avoid getpwuid syscall at startup).
     user_name: Option<String>,
+    /// Host name, cached once at startup so prompt escapes never call
+    /// `gethostname` or allocate on every prompt.
+    hostname: String,
     /// Cache of the resolved git directory for the last prompt's cwd and
     /// `GIT_DIR`, so the common case only reads `HEAD` instead of walking the
     /// tree. `None` in the last slot means "not inside a repository".
@@ -250,8 +253,12 @@ impl Shell {
             procsubst_fds: Vec::new(),
             home_dir: None,
             user_name: None,
+            hostname: String::new(),
             git_cache: None,
         };
+        let host = sys::hostname();
+        sh.hostname = host.clone();
+        let _ = sh.set_str("HOSTNAME", host);
         // PWD — needed for autocd and relative path resolution.
         let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
         let _ = sh.set_str("PWD", cwd);
@@ -290,7 +297,6 @@ impl Shell {
         if sh.get("PS4").is_none() {
             let _ = sh.set_str("PS4", "+ ");
         }
-        let _ = sh.set_str("HOSTNAME", sys::hostname());
         let exe = sh.self_exe.clone();
         let _ = sh.set_str("SHELL", exe);
         sh
@@ -464,6 +470,10 @@ impl Shell {
 
     pub fn cwd(&mut self) -> String {
         self.get("PWD").unwrap_or_else(|| "/".to_string())
+    }
+
+    pub fn hostname(&self) -> &str {
+        &self.hostname
     }
 
     // ---------- command lookup ----------

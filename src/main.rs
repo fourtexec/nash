@@ -144,6 +144,8 @@ fn call_hook(sh: &mut Shell, name: &str, args: &[String]) {
 
 fn interactive_loop(sh: &mut Shell) -> R {
     let mut warned_jobs = false;
+    let mut pcache = prompt::PromptCache::new();
+    let mut rcache = prompt::PromptCache::new();
     loop {
         sh.notify_jobs();
         sys::take_pending(libc::SIGINT);
@@ -153,14 +155,8 @@ fn interactive_loop(sh: &mut Shell) -> R {
             sh.last_status = st;
         }
         call_hook(sh, "precmd", &[]);
-        let prompt = match sh.get("PS1") {
-            Some(p) => prompt::expand_prompt(sh, &p),
-            None => prompt::default_prompt(sh),
-        };
-        let rprompt = match sh.get("RPROMPT").or_else(|| sh.get("RPS1")) {
-            Some(p) => prompt::expand_prompt(sh, &p),
-            None => String::new(),
-        };
+        let prompt = pcache.render(sh, &["PS1"], prompt::DEFAULT_PS1);
+        let rprompt = rcache.render(sh, &["RPROMPT", "RPS1"], "");
         if sh.job_control {
             unsafe {
                 let mut t: libc::termios = std::mem::zeroed();
@@ -169,7 +165,7 @@ fn interactive_loop(sh: &mut Shell) -> R {
                 }
             }
         }
-        let mut line = match editor::read_line(sh, &prompt, &rprompt) {
+        let mut line = match editor::read_line(sh, prompt, rprompt) {
             Input::Eof => {
                 if sh.jobs.iter().any(|j| j.stopped()) && !warned_jobs {
                     err!("\nnash: there are stopped jobs\n");
@@ -241,6 +237,9 @@ fn interactive_loop(sh: &mut Shell) -> R {
 fn setup_interactive(sh: &mut Shell, norc: bool, login: bool, restore_dir: bool) {
     sh.interactive = true;
     sh.opts.autocd = true;
+    // Expose the built-in prompt as a normal PS1 string, like bash/zsh do.
+    // Do this before sourcing the rc files so they can inspect or replace it.
+    prompt::install_default_ps1(sh);
     let tty = sys::open("/dev/tty", libc::O_RDWR | libc::O_CLOEXEC, 0);
     let tty = if tty >= 0 {
         let hi = sys::save_fd(tty);

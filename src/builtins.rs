@@ -442,6 +442,8 @@ nash additions:
 Prompt escapes (PS1/RPROMPT): bash's \\u \\h \\w \\W \\$ \\t ... plus
   \\g git branch, \\? last exit status, \\P pipeline statuses (a|b|c),
   \\L duration of the last command.
+  Default PS1 \\U\\C\\G\\J\\M\\Q\\Z = SSH user@host, styled cwd, git,
+  jobs, duration, status and symbol. Edit PS1 to reorder or drop them.
 
 Builtins:";
 
