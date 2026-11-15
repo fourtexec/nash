@@ -1524,6 +1524,11 @@ impl Shell {
         for item in items {
             let name = match item {
                 Item::A(a) => {
+                    if cmd == "export" && a.append && matches!(a.value, crate::ast::AssignVal::Array(_)) {
+                        sherr!("{}: append to array not allowed with export", cmd);
+                        status = 1;
+                        continue;
+                    }
                     self.do_assign(a, is_local, map)?;
                     a.name.clone()
                 }
