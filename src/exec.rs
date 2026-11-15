@@ -7,6 +7,7 @@ use crate::shell::*;
 use crate::sys::{self, WaitStatus};
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::fd::FromRawFd;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -407,7 +408,7 @@ impl Shell {
     // ---------- processes ----------
 
     pub fn fork(&mut self) -> Result<i32, Flow> {
-        let pid = unsafe { libc::fork() };
+        let pid = sys::fork();
         if pid < 0 {
             return self.fail(format!("fork: {}", sys::last_error()));
         }
@@ -419,13 +420,11 @@ impl Shell {
         let was_interactive = self.interactive;
         self.is_child = true;
         if jc {
-            unsafe {
-                let pid = libc::getpid();
-                let pg = if pgid == 0 { pid } else { pgid };
-                libc::setpgid(0, pg);
-                if fg {
-                    libc::tcsetpgrp(self.tty, pg);
-                }
+            let pid = sys::getpid();
+            let pg = if pgid == 0 { pid } else { pgid };
+            let _ = sys::setpgid(0, pg);
+            if fg {
+                let _ = sys::tcsetpgrp(self.tty, pg);
             }
         }
         if was_interactive {
@@ -466,7 +465,7 @@ impl Shell {
                 status = s;
             }
         }
-        unsafe { libc::_exit(status) }
+        sys::_exit(status)
     }
 
     pub fn add_job(&mut self, pgid: i32, procs: Vec<Proc>, text: &str) -> usize {
@@ -483,15 +482,16 @@ impl Shell {
         let mut sigint = false;
         'outer: for (i, &pid) in pids.iter().enumerate() {
             loop {
-                let mut st = 0;
-                let r = unsafe { libc::waitpid(pid, &mut st, if jc { libc::WUNTRACED } else { 0 }) };
-                if r < 0 {
-                    if sys::errno() == libc::EINTR {
-                        continue;
+                let st = match sys::waitpid_status(pid, if jc { sys::WUNTRACED } else { 0 }) {
+                    Some(s) => s,
+                    None => {
+                        if sys::errno() == sys::EINTR {
+                            continue;
+                        }
+                        sts[i] = 127;
+                        break;
                     }
-                    sts[i] = 127;
-                    break;
-                }
+                };
                 match sys::decode_status(st) {
                     WaitStatus::Exited(c) => sts[i] = c,
                     WaitStatus::Signaled(s) => {
@@ -551,11 +551,10 @@ impl Shell {
 
     pub fn reap(&mut self) {
         loop {
-            let mut st = 0;
-            let pid = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED) };
-            if pid <= 0 {
-                break;
-            }
+            let (pid, st) = match sys::waitpid_any(sys::WNOHANG | sys::WUNTRACED | sys::WCONTINUED) {
+                Some(x) => x,
+                None => break,
+            };
             for j in &mut self.jobs {
                 for p in &mut j.procs {
                     if p.pid == pid {
@@ -624,9 +623,7 @@ impl Shell {
             self.exit_child(s);
         }
         if jc {
-            unsafe {
-                libc::setpgid(pid, pid);
-            }
+            let _ = sys::setpgid(pid, pid);
         }
         let sts = self.wait_job(if jc { pid } else { 0 }, vec![pid], &text)?;
         Ok(sts[0])
@@ -650,9 +647,7 @@ impl Shell {
             self.exit_child(s);
         }
         if jc {
-            unsafe {
-                libc::setpgid(pid, pid);
-            }
+            let _ = sys::setpgid(pid, pid);
         }
         self.last_bg = pid;
         let id = self.add_job(if jc { pid } else { 0 }, vec![Proc { pid, status: None, stopped: false }], text);
@@ -813,14 +808,15 @@ impl Shell {
 
     pub fn wait_pid(&mut self, pid: i32) -> i32 {
         loop {
-            let mut st = 0;
-            let r = unsafe { libc::waitpid(pid, &mut st, 0) };
-            if r < 0 {
-                if sys::errno() == libc::EINTR {
-                    continue;
+            let st = match sys::waitpid_status(pid, 0) {
+                Some(s) => s,
+                None => {
+                    if sys::errno() == sys::EINTR {
+                        continue;
+                    }
+                    return 127;
                 }
-                return 127;
-            }
+            };
             return match sys::decode_status(st) {
                 WaitStatus::Exited(c) => c,
                 WaitStatus::Signaled(s) => 128 + s,
@@ -873,7 +869,7 @@ impl Shell {
         }
         let dir = self.get("TMPDIR").unwrap_or_else(|| "/tmp".into());
         for n in 0..100 {
-            let path = format!("{}/nash-heredoc-{}-{}-{}", dir, unsafe { libc::getpid() }, self.rng % 100000, n);
+            let path = format!("{}/nash-heredoc-{}-{}-{}", dir, sys::getpid(), self.rng % 100000, n);
             let fd = sys::open(&path, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600);
             if fd >= 0 {
                 sys::write_fd(fd, s.as_bytes());
@@ -920,7 +916,7 @@ impl Shell {
                         continue;
                     }
                     if let Ok(n) = t.trim_end_matches('-').parse::<i32>() {
-                        if unsafe { libc::fcntl(n, libc::F_GETFD) } < 0 {
+                        if sys::fcntl_getfd(n) < 0 {
                             sherr!("{}: Bad file descriptor", n);
                             return Ok(false);
                         }
@@ -1205,14 +1201,12 @@ impl Shell {
             self.child_setup(jc, 0, true);
             match self.apply_redirs(redirs, None) {
                 Ok(true) => {}
-                _ => unsafe { libc::_exit(1) },
+                _ => sys::_exit(1),
             }
             self.do_exec(&path, &argv, &env);
         }
         if jc {
-            unsafe {
-                libc::setpgid(pid, pid);
-            }
+            let _ = sys::setpgid(pid, pid);
         }
         let sts = self.wait_job(if jc { pid } else { 0 }, vec![pid], &text)?;
         Ok(sts[0])
@@ -1265,7 +1259,7 @@ impl Shell {
             libc::execve(cpath.as_ptr(), pargs.as_ptr(), penv.as_ptr());
         }
         let e = sys::errno();
-        if e == libc::ENOEXEC {
+        if e == sys::ENOEXEC {
             // a script without a #! line: run it with nash itself
             let me = c(&self.self_exe);
             let mut sargs: Vec<CString> = vec![c("nash"), c(path)];
@@ -1278,10 +1272,10 @@ impl Shell {
         }
         if sys::is_dir(path) {
             sherr!("{}: Is a directory", argv[0]);
-            unsafe { libc::_exit(126) }
+            sys::_exit(126)
         }
         sherr!("{}: {}", argv[0], sys::strerror(e));
-        unsafe { libc::_exit(if e == libc::ENOENT { 127 } else { 126 }) }
+        sys::_exit(if e == sys::ENOENT { 127 } else { 126 })
     }
 
     // ---------- functions ----------

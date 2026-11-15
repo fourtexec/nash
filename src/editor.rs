@@ -146,7 +146,7 @@ fn unescape_word(s: &str) -> String {
 
 fn poll_byte(ms: i32) -> Option<u8> {
     let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
-    let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+    let r = sys::poll(&mut [pfd], ms);
     if r > 0 {
         sys::read_byte(0).ok().flatten()
     } else {
@@ -1155,19 +1155,17 @@ pub fn read_plain(prompt: &str) -> Input {
 }
 
 pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
-    let mut orig: libc::termios = unsafe { std::mem::zeroed() };
-    if !sys::isatty(0) || unsafe { libc::tcgetattr(0, &mut orig) } != 0 {
-        return read_plain(prompt);
-    }
+    let orig = match sys::tcgetattr(0) {
+        Some(t) => t,
+        None => return read_plain(prompt),
+    };
     let mut raw = orig;
-    raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
-    raw.c_cflag |= libc::CS8;
-    raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
-    raw.c_cc[libc::VMIN] = 1;
-    raw.c_cc[libc::VTIME] = 0;
-    unsafe {
-        libc::tcsetattr(0, libc::TCSADRAIN, &raw);
-    }
+    raw.c_iflag &= !(sys::BRKINT | sys::ICRNL | sys::INPCK | sys::ISTRIP | sys::IXON);
+    raw.c_cflag |= sys::CS8;
+    raw.c_lflag &= !(sys::ECHO | sys::ICANON | sys::IEXTEN | sys::ISIG);
+    raw.c_cc[sys::VMIN as usize] = 1;
+    raw.c_cc[sys::VTIME as usize] = 0;
+    let _ = sys::tcsetattr(0, sys::TCSADRAIN, &raw);
     let (head, last) = match prompt.rfind('\n') {
         Some(i) => (&prompt[..=i], &prompt[i + 1..]),
         None => ("", prompt),
@@ -1200,8 +1198,6 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
     ed.refresh();
     let r = ed.run();
     sys::write_fd(2, b"\x1b[?2004l");
-    unsafe {
-        libc::tcsetattr(0, libc::TCSADRAIN, &orig);
-    }
+    let _ = sys::tcsetattr(0, sys::TCSADRAIN, &orig);
     r
 }

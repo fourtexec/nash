@@ -33,6 +33,8 @@ pub use libc::{
     ECHO, ICANON, ISIG, IEXTEN, VMIN, VTIME,
     TCSANOW, TCSADRAIN, TCSAFLUSH,
     rlimit, rlim_t,
+    WCONTINUED, ENOENT, ENOEXEC,
+    F_GETFD,
     getpwnam, getpwuid, gethostname,
     rusage, RUSAGE_SELF, RUSAGE_CHILDREN,
     c_char, c_int, c_uint, c_void,
@@ -444,11 +446,25 @@ pub fn tcsetpgrp(fd: i32, pgid: i32) -> i32 {
     unsafe { libc::tcsetpgrp(fd, pgid) }
 }
 
-/// Wait for a child process to change state.
+/// Wait for a child process to change state. Returns the pid, or None on error.
 pub fn waitpid(pid: i32, opts: i32) -> Option<i32> {
     let mut st: libc::c_int = 0;
     let r = unsafe { libc::waitpid(pid, &mut st, opts) };
     if r < 0 { None } else { Some(r) }
+}
+
+/// Wait for a child process and return its exit status, or None on error.
+pub fn waitpid_status(pid: i32, opts: i32) -> Option<i32> {
+    let mut st: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut st, opts) };
+    if r < 0 { None } else { Some(st) }
+}
+
+/// Wait for any child process and return (pid, status), or None on error/no child.
+pub fn waitpid_any(opts: i32) -> Option<(i32, i32)> {
+    let mut st: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(-1, &mut st, opts) };
+    if r < 0 { None } else { Some((r, st)) }
 }
 
 /// Return the process ID of the calling process.
@@ -459,6 +475,11 @@ pub fn getpid() -> i32 {
 /// Return the effective user ID.
 pub fn geteuid() -> libc::uid_t {
     unsafe { libc::geteuid() }
+}
+
+/// Return the effective group ID.
+pub fn getegid() -> libc::gid_t {
+    unsafe { libc::getegid() }
 }
 
 /// Return the real user ID.
@@ -502,4 +523,19 @@ pub fn tcgetattr(fd: i32) -> Option<libc::termios> {
 /// Set terminal attributes.
 pub fn tcsetattr(fd: i32, actions: i32, t: &libc::termios) -> i32 {
     unsafe { libc::tcsetattr(fd, actions, t) }
+}
+
+/// Terminate the process immediately.
+pub fn _exit(status: i32) -> ! {
+    unsafe { libc::_exit(status) }
+}
+
+/// Poll file descriptors (wrapper around libc::poll).
+pub fn poll(fds: &mut [libc::pollfd], timeout: i32) -> i32 {
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::c_uint, timeout) }
+}
+
+/// Fcntl operation F_GETFD.
+pub fn fcntl_getfd(fd: i32) -> i32 {
+    unsafe { libc::fcntl(fd, libc::F_GETFD) }
 }
