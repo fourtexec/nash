@@ -184,10 +184,14 @@ pub fn uninstall(_args: &[String]) -> i32 {
     }
 
     // Try to remove the installed binary (best effort).
-    let candidates = [
+    let mut candidates = vec![
         format!("{}/.local/bin/nash", home),
         "/usr/local/bin/nash".to_string(),
+        "/data/data/com.termux/files/usr/bin/nash".to_string(),
     ];
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        candidates.push(format!("{}/bin/nash", prefix));
+    }
     for c in &candidates {
         let _ = std::fs::remove_file(c);
     }

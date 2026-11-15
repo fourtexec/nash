@@ -6,7 +6,11 @@
 set -e
 
 REPO="fourtexec/nash"
-BIN_DIR="${HOME}/.local/bin"
+if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; then
+    BIN_DIR="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+else
+    BIN_DIR="${HOME}/.local/bin"
+fi
 mkdir -p "$BIN_DIR"
 
 os=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
@@ -60,7 +64,15 @@ done
 export PATH="$BIN_DIR:$PATH"
 
 # Make nash the login shell when possible.
-if command -v chsh >/dev/null 2>&1; then
+if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; then
+    if command -v chsh >/dev/null 2>&1; then
+        chsh -s nash 2>/dev/null || true
+    fi
+elif command -v chsh >/dev/null 2>&1; then
+    # ensure /etc/shells contains nash
+    if [ -w /etc/shells ] 2>/dev/null || [ "$(id -u)" = "0" ]; then
+        grep -qxF "$BIN_DIR/nash" /etc/shells 2>/dev/null || echo "$BIN_DIR/nash" >> /etc/shells
+    fi
     chsh -s "$BIN_DIR/nash" 2>/dev/null || true
 fi
 
