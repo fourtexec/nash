@@ -11,7 +11,7 @@ pub const BUILTINS: &[&str] = &[
 ];
 
 pub fn is_builtin(name: &str) -> bool {
-    BUILTINS.contains(&name)
+    matches!(name, "." | ":" | "[" | "abbr" | "alias" | "bg" | "break" | "builtin" | "cd" | "command" | "complete" | "contains" | "continue" | "count" | "declare" | "defer" | "dirs" | "disown" | "echo" | "eval" | "exec" | "exit" | "export" | "false" | "fg" | "functions" | "getopts" | "hash" | "help" | "history" | "jobs" | "kill" | "let" | "local" | "mapfile" | "math" | "path" | "popd" | "printf" | "pushd" | "pwd" | "read" | "readarray" | "readonly" | "realpath" | "return" | "set" | "set_color" | "setopt" | "shift" | "shopt" | "source" | "status" | "string" | "test" | "trap" | "true" | "type" | "typeset" | "ulimit" | "umask" | "unalias" | "unset" | "unsetopt" | "wait" | "which" | "z" | "zi")
 }
 
 /// Interpret backslash escapes (echo -e, printf %b). Returns (text, stop) where

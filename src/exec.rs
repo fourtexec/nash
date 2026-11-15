@@ -1036,6 +1036,16 @@ impl Shell {
             }
             return Ok(self.last_subst.unwrap_or(0));
         }
+        // Fast path for simple builtin commands without assignments/redirections.
+        if sc.assigns.is_empty() && sc.redirs.is_empty() {
+            if crate::builtins::is_builtin(&argv[0]) && argv[0] != "exec" {
+                if self.opts.xtrace {
+                    let line = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+                    self.xtrace(&line);
+                }
+                return self.run_builtin(&argv[0], &argv);
+            }
+        }
         if self.opts.xtrace {
             let line = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
             self.xtrace(&line);
