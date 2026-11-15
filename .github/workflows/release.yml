@@ -86,10 +86,13 @@ jobs:
           # one higher than the newest devN tag; dev1 if there is none yet
           last=$(git ls-remote --tags origin 'refs/tags/dev*' | sed -n 's|.*refs/tags/dev\([0-9][0-9]*\)$|\1|p' | sort -n | tail -n 1)
           echo "tag=dev$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
-      - name: Write SHA256SUMS
+      - name: Write VERSION and SHA256SUMS
         working-directory: dist
         run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "$version" > VERSION
           sha256sum nash-* > SHA256SUMS
+          cat VERSION
           cat SHA256SUMS
       - name: Publish the release
         env:
