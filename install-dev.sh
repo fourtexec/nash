@@ -39,7 +39,7 @@ esac
 asset="nash-${os}-${arch}"
 # Dev builds are published as the latest release.
 url="https://github.com/${REPO}/releases/latest/download/${asset}"
-tmp="${TMPDIR:-/tmp}/nash-dev.$$"
+tmp="$BIN_DIR/.nash-dev.$$"
 echo "install-dev: downloading latest dev build ($asset)"
 if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$url" -o "$tmp"
