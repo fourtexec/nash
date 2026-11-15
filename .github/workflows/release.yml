@@ -4,9 +4,9 @@ name: release
 # release:
 #   - every push to main is a development build tagged dev1, dev2, dev3, ...
 #   - pushing a tag v1.2.3 is the stable release 1.2.3
-# The manifest on https://fourtexec.site/nash/manifest.json is regenerated
-# from the releases by a workflow of fourtexec/fourtexec.github.io, and
-# `nash update`, `nash update dev` and `nash update VERSION` install from it.
+# After a release the `site` job updates fourtexec.site: the manifest on
+# https://fourtexec.site/nash/manifest.json, which `nash update`, `nash update
+# dev` and `nash update VERSION` install from, and the nash project page.
 on:
   push:
     branches: [main]
@@ -104,6 +104,8 @@ jobs:
     needs: [name, build, build-android-termux]
     if: needs.name.outputs.tag != ''
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ needs.name.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -125,11 +127,66 @@ jobs:
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "nash $TAG" --generate-notes
           fi
-      # Without the secret the site still picks the release up by itself,
-      # within half an hour. SITE_DISPATCH_TOKEN: a fine-grained token with
-      # "Contents: read and write" on fourtexec/fourtexec.github.io.
-      - name: Tell fourtexec.site to regenerate the manifest
+
+  # Bring fourtexec.site up to date with the release: the manifest that
+  # `nash update` reads (nash/manifest.json) and the project page with the
+  # newest releases and changes (projects/nash.md). Both are written by the
+  # generator of the site repository.
+  #
+  # Needs the SITE_TOKEN secret: a fine-grained token with "Contents: read
+  # and write" on fourtexec/fourtexec.github.io. Without it this job does
+  # nothing and the site catches up by itself within half an hour.
+  site:
+    needs: release
+    runs-on: ubuntu-latest
+    # the site's generator only reads the releases of this repository
+    permissions:
+      contents: read
+    # one push to the site at a time, whatever branch or tag started it
+    concurrency:
+      group: nash-site
+      cancel-in-progress: false
+    env:
+      SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+    steps:
+      - name: Is there a token for the site?
+        id: token
+        run: |
+          if [ -n "$SITE_TOKEN" ]; then
+            echo "present=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SITE_TOKEN is not set: fourtexec.site will pick this release up by itself"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'yes'
+        with:
+          repository: fourtexec/fourtexec.github.io
+          ref: ghpages
+          token: ${{ secrets.SITE_TOKEN }}
+      - name: Regenerate the manifest and the project page
+        if: steps.token.outputs.present == 'yes'
         env:
-          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
-        if: env.GH_TOKEN != ''
-        run: gh api repos/fourtexec/fourtexec.github.io/dispatches -f event_type=nash-release
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/test_nash_manifest.py
+          mkdir -p nash projects
+          python3 .github/scripts/nash-manifest.py nash/manifest.json projects/nash.md
+      - name: Push to fourtexec.site
+        if: steps.token.outputs.present == 'yes'
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          git add nash/manifest.json projects/nash.md
+          if git diff --cached --quiet; then
+            echo 'Nothing changed.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "nash $TAG"
+          # Workflows of the site commit to the same branch.
+          for attempt in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1
