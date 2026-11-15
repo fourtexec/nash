@@ -37,18 +37,26 @@ case "$arch" in
 esac
 
 asset="nash-${os}-${arch}"
-# Dev builds are published as the latest release.
-url="https://github.com/${REPO}/releases/latest/download/${asset}"
-tmp="$BIN_DIR/.nash-dev.$$"
-echo "install-dev: downloading latest dev build ($asset)"
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp"
+    get() { curl -fsSL "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$url"
+    get() { wget -qO- "$1"; }
 else
     echo "install-dev: needs curl or wget" >&2
     exit 1
 fi
+# Dev builds are the releases tagged dev1, dev2, ... (pre-releases): take the
+# one with the highest number.
+tag=$(get "https://api.github.com/repos/${REPO}/releases?per_page=100" |
+    tr ',' '\n' | sed -n 's/.*"tag_name": *"dev\([0-9][0-9]*\)".*/\1/p' | sort -n | tail -n 1)
+if [ -z "$tag" ]; then
+    echo "install-dev: cannot find the latest dev build" >&2
+    exit 1
+fi
+url="https://github.com/${REPO}/releases/download/dev${tag}/${asset}"
+tmp="$BIN_DIR/.nash-dev.$$"
+echo "install-dev: downloading dev${tag} ($asset)"
+get "$url" > "$tmp"
 chmod 755 "$tmp"
 mv -f "$tmp" "$BIN_DIR/nash"
 

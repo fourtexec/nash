@@ -3,10 +3,12 @@ name: release
 # Builds nash for every supported platform and publishes the binaries as a
 # release:
 #   - every push to main is a development build tagged dev1, dev2, dev3, ...
+#     and marked as a pre-release
 #   - pushing a tag v1.2.3 is the stable release 1.2.3
-# After a release the `site` job updates fourtexec.site: the manifest on
-# https://fourtexec.site/nash/manifest.json, which `nash update`, `nash update
-# dev` and `nash update VERSION` install from, and the nash project page.
+# Every release carries the same files (nash-<os>-<cpu> and SHA256SUMS), and
+# `nash update`, `nash update dev` and `nash update VERSION` download the one
+# for their platform straight from the release.
+# After a release the `site` job updates the nash page of fourtexec.site.
 on:
   push:
     branches: [main]
@@ -121,17 +123,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.name.outputs.tag }}
         run: |
+          # A development build is a pre-release, so that GitHub's "latest
+          # release" (and with it `nash update`) is always a stable one.
+          case "$TAG" in
+            dev*) kind="--prerelease --latest=false" ;;
+            *) kind="" ;;
+          esac
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             # a release made by hand for this tag: add the binaries to it
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            case "$TAG" in dev*) gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease ;; esac
           else
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "nash $TAG" --generate-notes
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "nash $TAG" --generate-notes $kind
           fi
+      - name: Mark older development builds as pre-releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the builds published before development builds were pre-releases
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --exclude-pre-releases --json tagName --jq '.[].tagName' |
+            grep -E '^dev[0-9]+$' |
+            while read -r tag; do
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --prerelease
+            done || true
 
-  # Bring fourtexec.site up to date with the release: the manifest that
-  # `nash update` reads (nash/manifest.json) and the project page with the
-  # newest releases and changes (projects/nash.md). Both are written by the
-  # generator of the site repository.
+  # Bring fourtexec.site up to date with the release: the project page with
+  # the newest releases and changes (projects/nash.md) and the list of
+  # releases (nash/manifest.json). Both are written by the generator of the
+  # site repository.
   #
   # Needs the SITE_TOKEN secret: a fine-grained token with "Contents: read
   # and write" on fourtexec/fourtexec.github.io. Without it this job does
