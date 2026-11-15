@@ -155,6 +155,8 @@ git subcommands and branches, cargo subcommands, and anything registered with
 | `builtins.rs`, `cond.rs` | builtin commands, `test` and `[[ ]]` |
 | `editor.rs`, `highlight.rs`, `prompt.rs`, `history.rs` | the interactive experience |
 
+Made by fourtexec
+
 ## License
 
 MIT
