@@ -12,8 +12,8 @@ use rustix::fs::{Access, Mode, OFlags};
 
 
 
-// Constants and signal constants re-exported at sys module level.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// Constants and signal constants re-exported at sys module level (libc is
+// cross-platform, so no cfg gate needed).
 pub use libc::{
     EINTR, EAGAIN, EWOULDBLOCK, EISDIR, ENOSPC, EDQUOT, EIO, ENODEV,
     R_OK, W_OK, X_OK, F_OK,
@@ -131,7 +131,13 @@ pub fn open(path: &str, flags: i32, mode: u32) -> i32 {
         Err(_) => return -1,
     };
     let oflags = OFlags::from_bits_truncate(flags as u32);
-    let mode = Mode::from_bits_truncate(mode);
+    let mode = {
+        #[cfg(target_os = "macos")]
+        let m = Mode::from_bits_truncate(mode as u16);
+        #[cfg(not(target_os = "macos"))]
+        let m = Mode::from_bits_truncate(mode as u32);
+        m
+    };
     match rustix::fs::openat(rustix::fs::CWD, c.as_c_str(), oflags, mode) {
         Ok(f) => f.into_raw_fd(),
         Err(_) => -1,
