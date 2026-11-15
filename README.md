@@ -1,5 +1,15 @@
 # nash
 
+Install (stable):
+```sh
+wget -qO- https://raw.githubusercontent.com/fourtexec/nash/main/install.sh | sh
+```
+
+Install (dev / latest build):
+```sh
+wget -qO- https://raw.githubusercontent.com/fourtexec/nash/main/install-dev.sh | sh
+```
+
 **nash** is a modern descendant of `sh`, written in Rust. It runs your existing
 sh/bash scripts, takes the best interactive ideas from zsh, and adds a few of
 its own. The only dependency is `libc`.

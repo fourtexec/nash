@@ -34,7 +34,9 @@ case "$arch" in
 esac
 
 asset="nash-${os}-${arch}"
-url="https://github.com/${REPO}/releases/latest/download/${asset}"
+# Stable: pinned to the latest stable release tag.
+STABLE_TAG="v0.1.0"
+url="https://github.com/${REPO}/releases/download/${STABLE_TAG}/${asset}"
 tmp="${TMPDIR:-/tmp}/nash.$$"
 echo "install: downloading $asset"
 if command -v curl >/dev/null 2>&1; then
