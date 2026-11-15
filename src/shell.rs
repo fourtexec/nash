@@ -265,7 +265,7 @@ impl Shell {
         let _ = sh.set_str("SHLVL", lvl.to_string());
         sh.export_var("SHLVL");
         let _ = sh.set_str("PPID", unsafe { libc::getppid() }.to_string());
-        let _ = sh.set_str("NASH_VERSION", env!("CARGO_PKG_VERSION"));
+        let _ = sh.set_str("NASH_VERSION", crate::version());
         let _ = sh.set_str("OPTIND", "1");
         let _ = sh.set_str("PS2", "… ");
         let _ = sh.set_str("PS4", "+ ");

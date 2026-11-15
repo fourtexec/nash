@@ -39,8 +39,18 @@ options:
 
 nash install    install nash and make it your login shell (see `nash install --help')
 nash uninstall  remove nash installed by the install script
-nash update     update nash to the newest release from GitHub (see `nash update --help')
+nash update     update nash to the newest release; `nash update dev' and
+                `nash update VERSION' pick others (see `nash update --help')
 ";
+
+/// The version of this build: the release it was built for (`0.1.1`, `dev7`;
+/// the release workflow sets NASH_RELEASE), else the version of the crate.
+pub fn version() -> &'static str {
+    match option_env!("NASH_RELEASE") {
+        Some(v) if !v.is_empty() => v.strip_prefix('v').unwrap_or(v),
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
 
 /// Run exit handlers and terminate.
 fn finish(sh: &mut Shell, r: R) -> ! {
@@ -316,7 +326,7 @@ fn main() {
         let a = &args[i];
         match a.as_str() {
             "--version" => {
-                out!("nash {}\n", env!("CARGO_PKG_VERSION"));
+                out!("nash {}\n", version());
                 return;
             }
             "--help" => {
