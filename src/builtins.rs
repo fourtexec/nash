@@ -2730,7 +2730,6 @@ impl Shell {
     }
 
     fn builtin_ulimit(&mut self, args: &[String]) -> R {
-        use libc::rlimit;
         #[derive(Clone, Copy)]
         struct Res { flag: char, name: &'static str, res: i32 }
         let mut resources: Vec<Res> = Vec::new();

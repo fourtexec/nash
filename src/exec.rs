@@ -7,7 +7,6 @@ use crate::shell::*;
 use crate::sys::{self, WaitStatus};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::FromRawFd;
 use std::rc::Rc;
 use std::time::Instant;
 

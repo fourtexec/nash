@@ -14,6 +14,7 @@ use rustix::fs::{Access, Mode, OFlags};
 
 // Constants and signal constants re-exported at sys module level (libc is
 // cross-platform, so no cfg gate needed).
+#[allow(unused_imports)]
 pub use libc::{
     EINTR, EAGAIN, EWOULDBLOCK, EISDIR, ENOSPC, EDQUOT, EIO, ENODEV,
     R_OK, W_OK, X_OK, F_OK,
@@ -229,6 +230,7 @@ pub fn now_secs() -> i64 {
 
 pub fn strftime(fmt: &str, t: i64) -> String {
     unsafe {
+        #[allow(deprecated)]
         let tt = t as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&tt, &mut tm);
@@ -538,7 +540,7 @@ pub fn _exit(status: i32) -> ! {
 
 /// Poll file descriptors (wrapper around libc::poll).
 pub fn poll(fds: &mut [libc::pollfd], timeout: i32) -> i32 {
-    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::c_uint, timeout) }
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) }
 }
 
 /// Fcntl operation F_GETFD.
