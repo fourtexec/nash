@@ -984,13 +984,19 @@ impl<'a> Editor<'a> {
                 }
                 Key::Alt('\n') => self.insert_str("\n"),
                 Key::Ctrl('c') => {
-                    // Match fish behavior: clear the line and return Interrupt,
-                    // without printing ^C or a newline. The terminal may show ^C
-                    // on its own, and the prompt will be redrawn on the next loop.
+                    // fish's `cancel-commandline` (src/reader/reader.rs): on an
+                    // empty command line there is nothing to cancel, so do
+                    // nothing and keep reading; otherwise discard what was typed
+                    // and redraw the prompt in place.  No `^C`, no newline, and
+                    // no change to the last exit status.
+                    if self.buf.is_empty() && self.menu.is_none() && self.search.is_none() {
+                        continue;
+                    }
+                    self.menu = None;
+                    self.search = None;
+                    self.suggestion.clear();
                     self.buf.clear();
                     self.cur = 0;
-                    self.finish();
-                    return Input::Interrupt;
                 }
                 Key::Ctrl('d') => {
                     if self.buf.is_empty() {
@@ -1175,9 +1181,22 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
         None => ("", prompt),
     };
     let (cols, _) = sys::term_size();
-    // make sure the prompt starts in column 0 even if the last command's
-    // output did not end with a newline (marked with a reverse-video %)
-    let intro = format!("\x1b[?2004h\x1b[7m%\x1b[0m{}\r\x1b[K{}", " ".repeat(cols.saturating_sub(1)), head);
+    // zsh's PROMPT_SP heuristic (Src/utils.c:preprompt): print an end-of-line
+    // mark (bold standout `%`), then enough spaces to run the cursor to the
+    // start of the next line, then CR, then one space (the mark width) and CR
+    // again.  If the previous command's output ended with a newline the cursor
+    // is already in column 0, so the mark is overwritten and the prompt starts
+    // cleanly; if the output was left dangling on the line the run of spaces
+    // wraps first, leaving the mark visible at the end of that line and the
+    // prompt on a fresh line.
+    let mut intro = String::with_capacity(cols + head.len() + 16);
+    intro.push_str("\x1b[?2004h");
+    intro.push_str("\x1b[1m\x1b[7m%\x1b[0m");
+    intro.extend(std::iter::repeat(' ').take(cols.saturating_sub(1)));
+    intro.push('\r');
+    intro.push(' ');
+    intro.push('\r');
+    intro.push_str(head);
     sys::write_fd(2, intro.as_bytes());
     let cwd = sh.cwd();
     let ls = crate::colors::LsColors::parse(&sh.get("LS_COLORS").unwrap_or_default());

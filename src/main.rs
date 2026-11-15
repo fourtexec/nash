@@ -180,7 +180,8 @@ fn interactive_loop(sh: &mut Shell) -> R {
                 return Ok(sh.last_status);
             }
             Input::Interrupt => {
-                sh.last_status = 130;
+                // Ctrl+C at the prompt: fish cancels the command line without
+                // changing the last exit status, so just re-prompt.
                 continue;
             }
             Input::Line(l) => l,
