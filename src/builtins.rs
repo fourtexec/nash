@@ -7,7 +7,7 @@ use crate::sys;
 use std::rc::Rc;
 
 pub const BUILTINS: &[&str] = &[
-    ".", ":", "[", "abbr", "alias", "bg", "break", "builtin", "cd", "command", "complete", "contains", "continue", "count", "declare", "defer", "dirs", "disown", "echo", "eval", "exec", "exit", "export", "false", "fg", "functions", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "mapfile", "math", "path", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "realpath", "return", "set", "set_color", "setopt", "shift", "shopt", "source", "status", "string", "test", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait", "which", "z",
+    ".", ":", "[", "abbr", "alias", "bg", "break", "builtin", "cd", "command", "complete", "contains", "continue", "count", "declare", "defer", "dirs", "disown", "echo", "eval", "exec", "exit", "export", "false", "fg", "functions", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "mapfile", "math", "path", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "realpath", "return", "set", "set_color", "setopt", "shift", "shopt", "source", "status", "string", "test", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait", "which", "z", "zi",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -972,6 +972,30 @@ impl Shell {
                 Ok(0)
             }
             "z" => self.builtin_z(args),
+            "zi" => {
+                if self.find_command("zoxide").is_some() {
+                    let cwd = self.cwd();
+                    let mut cmd = std::process::Command::new("zoxide");
+                    cmd.arg("query").arg("--interactive").arg("--exclude").arg(&cwd);
+                    cmd.args(args);
+                    match cmd.output() {
+                        Ok(o) if o.status.success() => {
+                            let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            if path.is_empty() {
+                                sherr!("zi: no match");
+                                return Ok(1);
+                            }
+                            return self.builtin_cd(&[path]);
+                        }
+                        _ => {
+                            sherr!("zi: no match");
+                            return Ok(1);
+                        }
+                    }
+                }
+                sherr!("zi: zoxide not found");
+                Ok(1)
+            }
             "abbr" => {
                 // fish-style abbreviations, mapped onto nash aliases.
                 let mut erase = false;
@@ -1356,6 +1380,9 @@ impl Shell {
                 if self.interactive {
                     self.z_add(&newpwd);
                     self.save_last_dir();
+                    if self.find_command("zoxide").is_some() {
+                        let _ = std::process::Command::new("zoxide").arg("add").arg(&newpwd).status();
+                    }
                 }
                 if let Some(f) = self.funcs.get("chpwd").cloned() {
                     let st = self.last_status;
@@ -2230,6 +2257,41 @@ impl Shell {
     }
 
     fn builtin_z(&mut self, args: &[String]) -> R {
+        // Prefer zoxide when available.
+        if self.find_command("zoxide").is_some() {
+            if args.is_empty() {
+                let home = self.home();
+                return self.builtin_cd(&[home]);
+            }
+            if args.len() == 1 && args[0] == "-" {
+                return self.builtin_cd(&["-".to_string()]);
+            }
+            if args.len() == 1 && (args[0].starts_with('/') || args[0].starts_with('.') || sys::is_dir(&args[0])) {
+                return self.builtin_cd(&[args[0].clone()]);
+            }
+            let cwd = self.cwd();
+            let mut cmd = std::process::Command::new("zoxide");
+            cmd.arg("query").arg("--exclude").arg(&cwd);
+            cmd.args(args);
+            match cmd.output() {
+                Ok(o) if o.status.success() => {
+                    let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if path.is_empty() {
+                        sherr!("z: no match");
+                        return Ok(1);
+                    }
+                    let r = self.builtin_cd(&[path.clone()])?;
+                    if r == 0 && self.get("_ZO_ECHO").as_deref() == Some("1") {
+                        err!("{}\n", path);
+                    }
+                    return Ok(r);
+                }
+                _ => {
+                    sherr!("z: no match");
+                    return Ok(1);
+                }
+            }
+        }
         let now = sys::now_secs();
         let frecency = |score: f64, last: i64| {
             let age = now - last;
