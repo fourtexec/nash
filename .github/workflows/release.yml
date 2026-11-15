@@ -1,7 +1,8 @@
 name: release
 
-# Pushing a tag like v0.2.0 builds nash for every supported platform and
-# publishes the binaries `nash update` downloads.
+# Every push to main builds nash for every supported platform and publishes
+# the binaries as a release tagged dev1, dev2, dev3, ... Users download the
+# binary for their platform and install it with `nash update PATH`.
 on:
   push:
     branches: [main]
@@ -10,6 +11,11 @@ on:
 
 permissions:
   contents: write
+
+# One release at a time, so two pushes cannot pick the same dev number.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -23,15 +29,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check that the tag matches Cargo.toml
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
-            exit 1
-          fi
       - name: Install the Rust target
         run: rustup target add ${{ matrix.target }}
       - name: Install musl tools
@@ -51,15 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check that the tag matches Cargo.toml
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -95,17 +83,17 @@ jobs:
       - name: Compute release tag
         id: tag
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          echo "tag=v${version}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-      - name: Write VERSION and SHA256SUMS
+          # one higher than the newest devN tag; dev1 if there is none yet
+          last=$(git ls-remote --tags origin 'refs/tags/dev*' | sed -n 's|.*refs/tags/dev\([0-9][0-9]*\)$|\1|p' | sort -n | tail -n 1)
+          echo "tag=dev$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+      - name: Write SHA256SUMS
         working-directory: dist
         run: |
           sha256sum nash-* > SHA256SUMS
-          echo "${{ steps.tag.outputs.tag }}" > VERSION
           cat SHA256SUMS
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
-          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --title "nash $tag" --generate-notes || gh release upload "$tag" dist/* --clobber
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "nash $tag" --generate-notes

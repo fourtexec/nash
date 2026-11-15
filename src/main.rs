@@ -38,7 +38,7 @@ options:
   --help        print this help
 
 nash install    install nash and make it your login shell (see `nash install --help')
-nash update     update nash to the newest release from GitHub (see `nash update --help')
+nash update PATH  replace nash with a newer binary you downloaded (see `nash update --help')
 ";
 
 /// Run exit handlers and terminate.

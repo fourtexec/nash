@@ -38,21 +38,25 @@ subcommand, run a script that happens to be called `install` as `nash ./install`
 
 ## Update
 
+Download the binary for your platform from
+[GitHub releases](https://github.com/fourtexec/nash/releases) (for example
+`nash-linux-x86_64`), then hand it to nash:
+
 ```bash
-nash update
+nash update ~/Downloads/nash-linux-x86_64
 ```
 
-This downloads the newest release from
-[GitHub releases](https://github.com/fourtexec/nash/releases), verifies its
-SHA-256 checksum and replaces the nash binary you are running (use `sudo` if it
-lives in `/usr/local/bin`). `nash update --check` only reports whether a newer
-version exists, `--force` reinstalls the current one. It needs `curl` or `wget`;
-binaries are published for Linux and macOS on x86_64 and aarch64. As with
-`install`, run a script called `update` as `nash ./update`.
+nash does not download anything itself. Before replacing the binary you are
+running (use `sudo` if it lives in `/usr/local/bin`), it checks the file you
+gave it: it must be an executable built for this operating system and CPU, and
+it must run here and report itself as nash. A macOS binary on Linux, an aarch64
+binary on x86_64, a script or a half-finished download is refused and nothing is
+changed. `nash update --check PATH` only runs the checks. Binaries are published
+for Linux and macOS on x86_64 and aarch64, and for Android (Termux) on aarch64.
+As with `install`, run a script called `update` as `nash ./update`.
 
-To publish a release, bump `version` in `Cargo.toml` and push a matching tag
-(`git tag v0.2.0 && git push origin v0.2.0`); the release workflow builds and
-uploads the binaries.
+Every push to `main` publishes a release: the workflow builds the binaries and
+tags them `dev1`, `dev2`, `dev3`, ... (one higher than the newest `devN` tag).
 
 ## What you get
 
