@@ -180,18 +180,23 @@ pub struct Shell {
     pub func_names: Vec<String>,
     pub tty: i32,
     pub procsubst_fds: Vec<i32>,
+    /// Lazily resolved home directory (resolved on first access to avoid getpwuid syscall at startup).
+    home_dir: Option<String>,
+    /// Lazily resolved username (resolved on first access to avoid getpwuid syscall at startup).
+    user_name: Option<String>,
 }
 
 impl Shell {
     pub fn new() -> Shell {
+        let pid = unsafe { libc::getpid() };
+
+        // Only read PATH from env — do NOT load all vars (expensive syscall per var).
         let mut global = HashMap::new();
-        for (k, v) in std::env::vars_os() {
-            let (k, v) = (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned());
-            if crate::parser::is_name(&k) {
-                global.insert(k, Var { val: Val::Str(v), exported: true, readonly: false });
+        if let Ok(p) = std::env::var("PATH") {
+            if crate::parser::is_name("PATH") {
+                global.insert("PATH".to_string(), Var { val: Val::Str(p), exported: true, readonly: false });
             }
         }
-        let pid = unsafe { libc::getpid() };
         let mut sh = Shell {
             scopes: vec![global],
             pos_params: Vec::new(),
@@ -236,34 +241,13 @@ impl Shell {
             func_names: Vec::new(),
             tty: 0,
             procsubst_fds: Vec::new(),
+            home_dir: None,
+            user_name: None,
         };
-        // PWD
+        // PWD — needed for autocd and relative path resolution.
         let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
-        let pwd_ok = match sh.var("PWD") {
-            Some(Var { val: Val::Str(p), .. }) => {
-                let p = p.clone();
-                p.starts_with('/') && std::fs::canonicalize(&p).ok() == std::fs::canonicalize(&cwd).ok()
-            }
-            _ => false,
-        };
-        if !pwd_ok {
-            let _ = sh.set_str("PWD", cwd);
-        }
+        let _ = sh.set_str("PWD", cwd);
         sh.export_var("PWD");
-        let (user, home) = sys::current_user();
-        if sh.var("HOME").is_none() {
-            if let Some(h) = home {
-                let _ = sh.set_str("HOME", h);
-                sh.export_var("HOME");
-            }
-        }
-        if sh.var("USER").is_none() {
-            let _ = sh.set_str("USER", user);
-        }
-        if sh.var("PATH").is_none() {
-            let _ = sh.set_str("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-            sh.export_var("PATH");
-        }
         let lvl = sh.get("SHLVL").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) + 1;
         let _ = sh.set_str("SHLVL", lvl.to_string());
         sh.export_var("SHLVL");
@@ -312,6 +296,16 @@ impl Shell {
             }
             "LINENO" => return Some(self.lineno.to_string()),
             "FUNCNAME" => return self.func_names.last().cloned(),
+            "USER" => {
+                if let Some(u) = self.user_name.as_ref() {
+                    return Some(u.clone());
+                }
+                let u = sys::current_user().0;
+                self.user_name = Some(u.clone());
+                let _ = self.set_str("USER", u.clone());
+                self.export_var("USER");
+                return Some(u);
+            }
             _ => {}
         }
         match &self.var(name)?.val {
@@ -420,7 +414,18 @@ impl Shell {
     }
 
     pub fn home(&mut self) -> String {
-        self.get("HOME").unwrap_or_else(|| "/".to_string())
+        if let Some(h) = self.get("HOME") {
+            return h;
+        }
+        if let Some(h) = self.home_dir.as_ref() {
+            return h.clone();
+        }
+        // Lazily resolve HOME from the system (avoid getpwuid syscall at startup).
+        let h = sys::current_user().1.unwrap_or_else(|| "/".to_string());
+        self.home_dir = Some(h.clone());
+        let _ = self.set_str("HOME", h.clone());
+        self.export_var("HOME");
+        h
     }
 
     pub fn cwd(&mut self) -> String {
