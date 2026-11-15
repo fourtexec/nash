@@ -48,25 +48,38 @@ subcommand, run a script that happens to be called `install` as `nash ./install`
 
 ## Update
 
-Download the binary for your platform from
-[GitHub releases](https://github.com/fourtexec/nash/releases) (for example
-`nash-linux-x86_64`), then hand it to nash:
-
 ```bash
-nash update ~/Downloads/nash-linux-x86_64
+nash update
 ```
 
-nash does not download anything itself. Before replacing the binary you are
-running (use `sudo` if it lives in `/usr/local/bin`), it checks the file you
-gave it: it must be an executable built for this operating system and CPU, and
-it must run here and report itself as nash. A macOS binary on Linux, an aarch64
-binary on x86_64, a script or a half-finished download is refused and nothing is
-changed. `nash update --check PATH` only runs the checks. Binaries are published
-for Linux and macOS on x86_64 and aarch64, and for Android (Termux) on aarch64.
-As with `install`, run a script called `update` as `nash ./update`.
+installs the newest stable release. nash reads the release manifest at
+<https://fourtexec.site/nash/manifest.json>, takes the newest release that has
+a binary tagged with your platform (`linux`, `macos` or `android`; `amd64` or
+`arm64`), downloads it with curl or wget, checks its SHA-256 and that it runs
+here, and then replaces the binary you are running (use `sudo` if it lives in
+`/usr/local/bin`).
 
-Every push to `main` publishes a release: the workflow builds the binaries and
-tags them `dev1`, `dev2`, `dev3`, ... (one higher than the newest `devN` tag).
+```bash
+nash update dev
+```
+
+installs the newest development build instead, and
+
+```bash
+nash update 0.1.0
+```
+
+installs exactly that release, older ones included (`nash update dev7` works
+too). `nash update --list` shows what is available for your platform,
+`--check` only reports whether there is something to install (exit status 1 if
+so) and `--force` reinstalls the version you already have. As with `install`,
+run a script called `update` as `nash ./update`.
+
+Releases are made by the workflow in `.github/workflows/release.yml`: every
+push to `main` is a development build tagged `dev1`, `dev2`, `dev3`, ..., and
+pushing a tag `v1.2.3` publishes the stable release `1.2.3`. A workflow of the
+site repository then lists the new release in the manifest, twice an hour or at
+once if the `SITE_DISPATCH_TOKEN` secret is set here.
 
 ## What you get
 

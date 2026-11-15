@@ -1,11 +1,16 @@
 name: release
 
-# Every push to main builds nash for every supported platform and publishes
-# the binaries as a release tagged dev1, dev2, dev3, ... Users download the
-# binary for their platform and install it with `nash update PATH`.
+# Builds nash for every supported platform and publishes the binaries as a
+# release:
+#   - every push to main is a development build tagged dev1, dev2, dev3, ...
+#   - pushing a tag v1.2.3 is the stable release 1.2.3
+# The manifest on https://fourtexec.site/nash/manifest.json is regenerated
+# from the releases by a workflow of fourtexec/fourtexec.github.io, and
+# `nash update`, `nash update dev` and `nash update VERSION` install from it.
 on:
   push:
     branches: [main]
+    tags: ['v[0-9]*']
   pull_request:
   workflow_dispatch:
 
@@ -18,7 +23,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The name of the release, known before the build so that the binaries
+  # can report it (`nash --version`). Empty: a build that is not released.
+  name:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Compute release tag
+        id: tag
+        run: |
+          tag=
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            case "$GITHUB_REF" in
+              refs/tags/*) tag="${GITHUB_REF#refs/tags/}" ;;
+              *)
+                # one higher than the newest devN tag; dev1 if there is none yet
+                last=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" 'refs/tags/dev*' | sed -n 's|.*refs/tags/dev\([0-9][0-9]*\)$|\1|p' | sort -n | tail -n 1)
+                tag="dev$(( ${last:-0} + 1 ))"
+                ;;
+            esac
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: name
+    env:
+      NASH_RELEASE: ${{ needs.name.outputs.tag }}
     strategy:
       matrix:
         include:
@@ -45,6 +76,7 @@ jobs:
 
   build-android-termux:
     name: Build Android (Termux, aarch64, latest NDK)
+    needs: name
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +92,7 @@ jobs:
           ndk-version: r30
       - name: Build release binary
         env:
+          NASH_RELEASE: ${{ needs.name.outputs.tag }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
         run: cargo build --release --locked --target aarch64-linux-android
@@ -71,21 +104,14 @@ jobs:
           path: nash-android-aarch64
 
   release:
-    needs: [build, build-android-termux]
-    if: github.event_name == 'push'
+    needs: [name, build, build-android-termux]
+    if: needs.name.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Compute release tag
-        id: tag
-        run: |
-          # one higher than the newest devN tag; dev1 if there is none yet
-          last=$(git ls-remote --tags origin 'refs/tags/dev*' | sed -n 's|.*refs/tags/dev\([0-9][0-9]*\)$|\1|p' | sort -n | tail -n 1)
-          echo "tag=dev$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
       - name: Write SHA256SUMS
         working-directory: dist
         run: |
@@ -94,6 +120,19 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.name.outputs.tag }}
         run: |
-          tag="${{ steps.tag.outputs.tag }}"
-          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "nash $tag" --generate-notes
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # a release made by hand for this tag: add the binaries to it
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "nash $TAG" --generate-notes
+          fi
+      # Without the secret the site still picks the release up by itself,
+      # within half an hour. SITE_DISPATCH_TOKEN: a fine-grained token with
+      # "Contents: read and write" on fourtexec/fourtexec.github.io.
+      - name: Tell fourtexec.site to regenerate the manifest
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        if: env.GH_TOKEN != ''
+        run: gh api repos/fourtexec/fourtexec.github.io/dispatches -f event_type=nash-release
