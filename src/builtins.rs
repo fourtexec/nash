@@ -936,6 +936,10 @@ impl Shell {
                     i += 1;
                 }
                 if names.is_empty() && !remove {
+                    if func.is_some() {
+                        sherr!("complete: -F: option requires a command name");
+                        return Ok(2);
+                    }
                     let mut v: Vec<_> = self.completions.iter().collect();
                     v.sort();
                     for (k, w) in v {
