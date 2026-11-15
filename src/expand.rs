@@ -366,7 +366,10 @@ impl Shell {
         let s = self.expand_string(expr)?;
         match arith::eval(&s, self) {
             Ok(n) => Ok(n),
-            Err(e) => self.fail(e),
+            Err(e) => {
+                sherr!("{}", e);
+                Err(Flow::Abort(2))
+            }
         }
     }
 
