@@ -385,6 +385,13 @@ impl<'a> Editor<'a> {
             let t = self.text();
             if let Some(s) = self.sh.history.suggest(&t, &self.cwd) {
                 self.suggestion = s[t.len()..].to_string();
+            } else if !t.contains(char::is_whitespace) && !t.is_empty() {
+                // fish-style: suggest a command name when nothing in history matches
+                let mut names = self.sh.command_names();
+                names.sort();
+                if let Some(name) = names.into_iter().find(|n| n.starts_with(&t) && n.len() > t.len()) {
+                    self.suggestion = name[t.len()..].to_string();
+                }
             }
         }
     }
