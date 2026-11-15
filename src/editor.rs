@@ -985,7 +985,9 @@ impl<'a> Editor<'a> {
                 Key::Alt('\n') => self.insert_str("\n"),
                 Key::Ctrl('c') => {
                     self.finish();
-                    sys::write_fd(2, b"^C\r\n");
+                    // Match fish behavior: print ^C and a newline on stdout,
+                    // so the prompt appears on the next line.
+                    sys::write_fd(1, b"^C\n");
                     return Input::Interrupt;
                 }
                 Key::Ctrl('d') => {
