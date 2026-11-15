@@ -95,9 +95,12 @@ impl FB {
 
 fn needs_glob(f: &Field) -> bool {
     let mut prev = ' ';
-    for (c, q) in f {
+    for (i, (c, q)) in f.iter().enumerate() {
         if !*q {
-            if matches!(c, '*' | '?' | '[') || (*c == '(' && matches!(prev, '@' | '+' | '!')) {
+            if matches!(c, '*' | '?')
+                || (*c == '[' && f[i + 1..].iter().any(|(cc, qq)| !*qq && *cc == ']'))
+                || (*c == '(' && matches!(prev, '@' | '+' | '!'))
+            {
                 return true;
             }
             prev = *c;
