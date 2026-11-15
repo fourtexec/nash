@@ -1,0 +1,95 @@
+one
+two
+2
+has-err
+o
+e
+o2
+e2
+via3
+l=one
+nash: f1: cannot overwrite existing file
+noclobber
+y
+x|y|z
+1|2|3:4
+first=a
+b
+c
+[lead][trail]
+42 str     r|l    |00042 ff 10 c %
+1-2
+3-4
+a	b
+'it'\''s a test'
+005
+a
+b
+no-nl
+A
+B=val
+C
+rest=x y
+A
+C
+B=foo
+rest=z
+usr1
+after-usr1
+sub-exit
+sub=3
+wait=0
+wait=4
+all-done
+or-ok
+e-ok
+sub-e=1
+d
+u=1
+pf=1
+aliased arg
+cmd-v
+inner
+outer
+f 2
+0
+a=1
+b c=2
+1
+0:one
+1:two
+2:three
+one two three
+one,two,three
+4 four
+3 b
+1
+a.txt b.txt both.txt both2.txt err.txt fd3.txt
+*.nomatch
+a.txt b.txt
+c.log
+d1/d2/y.rs d1/x.rs
+quoted *.txt *.txt *.txt
+2
+1
+1 1 7 6 -6 16 -3 -1
+12
+13
+eval-13
+/
+st=0
+b
+> piped heredoc
+grep-ok
+num-eq
+test-o
+paren-eq
+not-e
+range
+digit
+contains
+ncontains
+<a><b><c>
+a_b_c a b c
+unset empty
+exit-trap

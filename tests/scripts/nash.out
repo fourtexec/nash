@@ -1,0 +1,28 @@
+Hello, World! (0 extra)
+Hi, Bob! (2 extra)
+nash: greet: missing argument `name'
+usage: greet <name> [greeting] [rest...]
+status=2
+nash: two: too many arguments (expected at most 2, got 3)
+before
+caught 1
+ok=0
+nash: division by 0
+arith caught
+inner failed with 4
+f=7
+body
+deferred 2
+deferred 1
+cleanup=3
+3.0 2 2.5 1 7 3 1
+word=hello
+n=3
+errexit on
+nounset on
+pipefail on
+a/1.rs a/b/2.rs a/b/c/3.rs
+a/1.rs a/b/2.rs
+k1 k2 v2
+hi-alias there
+none has-version

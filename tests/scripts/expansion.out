@@ -1,0 +1,58 @@
+[a b]
+[c]
+[a]
+[b]
+[c]
+a b c 2
+<a>
+<b>
+<>
+<c>
+[] [] dflt unset alt
+assigned assigned
+single $x double $x "q" \ \n ansi	cA
+a b cde
+*
+7 1024 1 1 6 16 8 5
+12 7 1
+2 1 0
+1 2 3 4  6 6 0 1 2 3 4 5
+2 3 6
+bcdef bc ef abcd cdef abXXef Abcdef ABCDEF
+tool.tar.gz /usr/local/bin /usr/local/bin/tool tar.gz
+[] 0
+f:2
+outer:[]
+x
+2
+7
+nested deep
+bt
+tab stripped abcdef
+herestring abcdef
+2 1
+4 3
+{a,b,c}{1,2} {01..03} {a..e..2} {5..1} x{,y} echo
+"{a,b}" {a} {} a{b echo
+"x y" in "x "*) echo m1;; esac case
+abc in a|b) echo no;; [a-c]bc) echo m2;; esac case
+z in a) echo a;& b) echo b;; z) echo z;& q) echo q;; r) echo r;; esac case
+1 -lt 2 ] && [ "a" != "b" ] && [ -n "x" ] && [ ! -z "x" ] && echo test-ok [
+-f /etc/passwd -a -d /tmp ] && echo and-ok [
+abc =~ ^a(b)c$ ]] && echo "re " [[
+-z "" && ( 1 -lt 2 || x == y ) ]] && echo cond-ok [[
+"a b" == "a b" ]] && [[ a < b ]] && echo str-ok [[
+false; then echo 1; elif true; then echo 2; else echo 3; fi if
+true; do echo never; done; echo until-ok until
+((i=0;i<3;i++)); do echo -n ; done; echo for
+i in 1 2 3 4; do [  = 2 ] && continue; [  = 4 ] && break; echo ; done for
+7); echo 0 (exit
+echo grp; } | cat {
+true; echo 0 !
+| false; echo 0 0 0 true
+out >&2 2>/dev/null echo
+err 2>&1 >/dev/null | cat echo
+{ return 5; }; f2 || echo "f2=0" f2()
+eval 'echo ev 5' x=1
+sh -c 'echo '; echo "[]" VAR=tmp
+EXP=1; sh -c 'echo ' export

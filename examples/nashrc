@@ -1,0 +1,29 @@
+# Example ~/.nashrc
+
+alias ll='ls -lah'
+alias gs='git status'
+
+# A two-sided prompt: directory and git branch on the left, time on the right.
+PS1='\[\e[1;34m\]\w\[\e[0m\] \[\e[35m\]\g\[\e[0m\] \$ '
+RPROMPT='\[\e[90m\]\L \A\[\e[0m\]'
+
+# Named parameters, defaults, defer and try/catch in one function.
+fn extract(archive, dest=.) {
+    try {
+        mkdir -p "$dest"
+        case "$archive" in
+            *.tar.gz|*.tgz) tar -xzf "$archive" -C "$dest" ;;
+            *.zip) unzip -q "$archive" -d "$dest" ;;
+            *) echo "extract: unknown archive type: $archive" >&2; false ;;
+        esac
+    } catch {
+        echo "extract: failed with status $ERROR" >&2
+        return 1
+    }
+}
+
+# Hooks: run after every directory change.
+chpwd() { ls; }
+
+# Simple word completion for your own commands.
+complete -W "start stop restart status" service-ctl
