@@ -788,17 +788,14 @@ impl Shell {
             "umask" => {
                 match args.first() {
                     None => {
-                        let m = unsafe {
-                            let m = libc::umask(0);
-                            libc::umask(m);
-                            m
-                        };
+                        let m = sys::umask(0);
+                        let _ = sys::umask(m);
                         out!("{:04o}\n", m);
                     }
                     Some(a) => match u32::from_str_radix(a, 8) {
-                        Ok(m) => unsafe {
-                            libc::umask(m as libc::mode_t);
-                        },
+                        Ok(m) => {
+                            let _ = sys::umask(m as libc::mode_t);
+                        }
                         Err(_) => {
                             sherr!("umask: {}: invalid octal number", a);
                             return Ok(1);
@@ -884,18 +881,14 @@ impl Shell {
                     for p in &mut j.procs {
                         p.stopped = false;
                     }
-                    unsafe {
-                        libc::kill(-j.pgid, libc::SIGCONT);
-                    }
+                    let _ = sys::kill(-j.pgid, sys::SIGCONT as i32);
                     err!("[{}] {} &\n", j.id, j.text);
                     return Ok(0);
                 }
                 let j = self.jobs.remove(idx);
                 err!("{}\n", j.text);
-                unsafe {
-                    libc::tcsetpgrp(self.tty, j.pgid);
-                    libc::kill(-j.pgid, libc::SIGCONT);
-                }
+                let _ = sys::tcsetpgrp(self.tty, j.pgid);
+                let _ = sys::kill(-j.pgid, sys::SIGCONT as i32);
                 let pids: Vec<i32> = j.procs.iter().filter(|p| p.status.is_none()).map(|p| p.pid).collect();
                 let sts = self.wait_job(j.pgid, pids, &j.text)?;
                 Ok(sts.last().copied().unwrap_or(0))
@@ -1653,9 +1646,9 @@ impl Shell {
                 None => {
                     self.traps.remove(&sig);
                     if sig > 0 {
-                        if self.interactive && sig == libc::SIGINT {
+                        if self.interactive && sig == sys::SIGINT as i32 {
                             sys::catch_signal(sig);
-                        } else if self.interactive && [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGQUIT, libc::SIGTERM].contains(&sig) {
+                        } else if self.interactive && [sys::SIGTSTP as i32, sys::SIGTTIN as i32, sys::SIGTTOU as i32, sys::SIGQUIT as i32, sys::SIGTERM as i32].contains(&sig) {
                             sys::ignore_signal(sig);
                         } else {
                             sys::default_signal(sig);
@@ -1729,20 +1722,17 @@ impl Shell {
         }
         let mut old_term: Option<libc::termios> = None;
         if tty && (silent || nchars.is_some() || delim != '\n') {
-            unsafe {
-                let mut t: libc::termios = std::mem::zeroed();
-                if libc::tcgetattr(fd, &mut t) == 0 {
-                    old_term = Some(t);
-                    if silent {
-                        t.c_lflag &= !libc::ECHO;
-                    }
-                    if nchars.is_some() || delim != '\n' {
-                        t.c_lflag &= !libc::ICANON;
-                        t.c_cc[libc::VMIN] = 1;
-                        t.c_cc[libc::VTIME] = 0;
-                    }
-                    libc::tcsetattr(fd, libc::TCSANOW, &t);
+            if let Some(mut t) = sys::tcgetattr(fd) {
+                old_term = Some(t);
+                if silent {
+                    t.c_lflag &= !sys::ECHO;
                 }
+                if nchars.is_some() || delim != '\n' {
+                    t.c_lflag &= !sys::ICANON;
+                    t.c_cc[sys::VMIN as usize] = 1;
+                    t.c_cc[sys::VTIME as usize] = 0;
+                }
+                let _ = sys::tcsetattr(fd, sys::TCSANOW, &t);
             }
         }
         let deadline = timeout.map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t));
@@ -1799,7 +1789,7 @@ impl Shell {
                     break;
                 }
                 Err(e) => {
-                    if e == libc::EINTR {
+                    if e == sys::EINTR {
                         if let Err(f) = self.check_signals() {
                             flow = Some(f);
                             break;
@@ -1812,9 +1802,7 @@ impl Shell {
             }
         }
         if let Some(t) = old_term {
-            unsafe {
-                libc::tcsetattr(fd, libc::TCSANOW, &t);
-            }
+            let _ = sys::tcsetattr(fd, sys::TCSANOW, &t);
             if silent && tty {
                 err!("\n");
             }
@@ -2012,7 +2000,7 @@ impl Shell {
                 let mut st = 0;
                 let r = unsafe { libc::waitpid(pid, &mut st, 0) };
                 if r < 0 {
-                    if sys::errno() == libc::EINTR {
+                    if sys::errno() == sys::EINTR {
                         self.check_signals()?;
                         if self.traps.keys().any(|k| *k > 0) {
                             return Ok(129);
@@ -2151,8 +2139,8 @@ impl Shell {
                 if libc::kill(target, sig) != 0 {
                     sherr!("kill: ({}) - {}", a, sys::last_error());
                     st = 1;
-                } else if a.starts_with('%') && sig != libc::SIGCONT && sig != libc::SIGSTOP {
-                    libc::kill(target, libc::SIGCONT);
+                } else if a.starts_with('%') && sig != sys::SIGCONT as i32 && sig != sys::SIGSTOP as i32 {
+                    let _ = sys::kill(target, sys::SIGCONT as i32);
                 }
             }
         }
@@ -2236,7 +2224,7 @@ impl Shell {
         }
         let path = format!("{}/z", self.data_dir());
         let body: String = v.iter().map(|(p, s, l)| format!("{:.2}\t{}\t{}\n", s, l, p)).collect();
-        let tmp = format!("{}.{}", path, unsafe { libc::getpid() });
+        let tmp = format!("{}.{}", path, sys::getpid());
         if std::fs::write(&tmp, body).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -2742,7 +2730,7 @@ impl Shell {
     }
 
     fn builtin_ulimit(&mut self, args: &[String]) -> R {
-        use libc::{RLIM_INFINITY, rlimit};
+        use libc::rlimit;
         #[derive(Clone, Copy)]
         struct Res { flag: char, name: &'static str, res: i32 }
         let mut resources: Vec<Res> = Vec::new();
@@ -2751,16 +2739,16 @@ impl Shell {
                 resources.push(Res { flag: $flag, name: $name, res: $r as i32 });
             };
         }
-        add!('c', "core file size", libc::RLIMIT_CORE);
-        add!('d', "data seg size", libc::RLIMIT_DATA);
-        add!('f', "file size", libc::RLIMIT_FSIZE);
-        add!('l', "max locked memory", libc::RLIMIT_MEMLOCK);
-        add!('m', "max memory size", libc::RLIMIT_RSS);
-        add!('n', "open files", libc::RLIMIT_NOFILE);
-        add!('s', "stack size", libc::RLIMIT_STACK);
-        add!('t', "cpu time", libc::RLIMIT_CPU);
-        add!('u', "max user processes", libc::RLIMIT_NPROC);
-        add!('v', "virtual memory", libc::RLIMIT_AS);
+        add!('c', "core file size", sys::RLIMIT_CORE);
+        add!('d', "data seg size", sys::RLIMIT_DATA);
+        add!('f', "file size", sys::RLIMIT_FSIZE);
+        add!('l', "max locked memory", sys::RLIMIT_MEMLOCK);
+        add!('m', "max memory size", sys::RLIMIT_RSS);
+        add!('n', "open files", sys::RLIMIT_NOFILE);
+        add!('s', "stack size", sys::RLIMIT_STACK);
+        add!('t', "cpu time", sys::RLIMIT_CPU);
+        add!('u', "max user processes", sys::RLIMIT_NPROC);
+        add!('v', "virtual memory", sys::RLIMIT_AS);
         // parse
         let mut hard_flag = false;
         let mut soft_flag = false;
@@ -2790,12 +2778,9 @@ impl Shell {
         if all {
             for r in &resources {
                 if r.res < 0 { continue; }
-                unsafe {
-                    let mut rl: rlimit = std::mem::zeroed();
-                    if libc::getrlimit(r.res as _, &mut rl) == 0 {
-                        let fmt = |x: libc::rlim_t| if x == RLIM_INFINITY { "unlimited".to_string() } else { x.to_string() };
-                        out!("{:<24} {}\n", r.name, fmt(rl.rlim_cur));
-                    }
+                if let Some(rl) = sys::getrlimit(r.res as _) {
+                    let fmt = |x: libc::rlim_t| if x == sys::RLIM_INFINITY { "unlimited".to_string() } else { x.to_string() };
+                    out!("{:<24} {}\n", r.name, fmt(rl.rlim_cur));
                 }
             }
             return Ok(0);
@@ -2813,23 +2798,21 @@ impl Shell {
             return Ok(1);
         }
         if value.is_none() {
-            unsafe {
-                let mut rl: rlimit = std::mem::zeroed();
-                if libc::getrlimit(res as _, &mut rl) != 0 {
-                    return Ok(1);
-                }
+            if let Some(rl) = sys::getrlimit(res as _) {
                 let v = if hard_flag && !soft_flag { rl.rlim_max } else { rl.rlim_cur };
-                if v == RLIM_INFINITY {
+                if v == sys::RLIM_INFINITY {
                     out!("unlimited\n");
                 } else {
                     out!("{}\n", v);
                 }
+            } else {
+                return Ok(1);
             }
             return Ok(0);
         }
         let val_str = value.unwrap();
         let new = if val_str == "unlimited" {
-            RLIM_INFINITY
+            sys::RLIM_INFINITY
         } else {
             match val_str.parse::<libc::rlim_t>() {
                 Ok(n) => n,
@@ -2839,21 +2822,19 @@ impl Shell {
                 }
             }
         };
-        unsafe {
-            let mut rl: rlimit = std::mem::zeroed();
-            if libc::getrlimit(res as _, &mut rl) != 0 {
-                return Ok(1);
-            }
+        if let Some(mut rl) = sys::getrlimit(res as _) {
             if soft {
                 rl.rlim_cur = new;
             }
             if hard {
                 rl.rlim_max = new;
             }
-            if libc::setrlimit(res as _, &rl) != 0 {
+            if sys::setrlimit(res as _, &rl) != 0 {
                 sherr!("ulimit: {}", sys::last_error());
                 return Ok(1);
             }
+        } else {
+            return Ok(1);
         }
         Ok(0)
     }

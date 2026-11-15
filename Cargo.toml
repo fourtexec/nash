@@ -8,6 +8,15 @@ readme = "README.md"
 
 [dependencies]
 libc = "0.2"
+rustix = { version = "0.38", default-features = false, features = [
+    "fs",
+    "pipe",
+    "process",
+    "stdio",
+    "termios",
+    "time",
+    "mm",
+] }
 
 [profile.release]
 lto = true
