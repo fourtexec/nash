@@ -1,7 +1,7 @@
 //! Prompt rendering.
 
 use crate::builtins::fmt_duration;
-use crate::shell::Shell;
+use crate::shell::{Shell, Val};
 use crate::sys;
 
 pub fn char_width(c: char) -> usize {
@@ -60,30 +60,67 @@ pub fn visible_width(s: &str) -> usize {
     w
 }
 
-pub fn git_branch(cwd: &str) -> Option<String> {
+/// Find the git directory (the one holding `HEAD`) by walking up from `cwd`.
+fn find_git_dir(cwd: &str) -> Option<String> {
     let mut dir = std::path::PathBuf::from(cwd);
     loop {
         let dotgit = dir.join(".git");
         if let Ok(meta) = std::fs::metadata(&dotgit) {
-            let head_path = if meta.is_dir() {
-                dotgit.join("HEAD")
-            } else {
-                let content = std::fs::read_to_string(&dotgit).ok()?;
-                let gd = content.trim().strip_prefix("gitdir: ")?.to_string();
-                let p = std::path::PathBuf::from(&gd);
-                (if p.is_absolute() { p } else { dir.join(p) }).join("HEAD")
-            };
-            let head = std::fs::read_to_string(head_path).ok()?;
-            let head = head.trim();
-            return Some(match head.strip_prefix("ref: refs/heads/") {
-                Some(b) => b.to_string(),
-                None => head.chars().take(7).collect(),
-            });
+            if meta.is_dir() {
+                return Some(dotgit.to_string_lossy().into_owned());
+            }
+            // Worktrees and submodules use a `.git` file with "gitdir: <path>".
+            let content = std::fs::read_to_string(&dotgit).ok()?;
+            let gd = content.trim().strip_prefix("gitdir: ")?;
+            let p = std::path::PathBuf::from(gd);
+            let abs = if p.is_absolute() { p } else { dir.join(p) };
+            return Some(abs.to_string_lossy().into_owned());
         }
         if !dir.pop() {
             return None;
         }
     }
+}
+
+/// Current git branch, or a short commit hash when detached. The repository
+/// lookup is cached per cwd (and `GIT_DIR`), so repeating the prompt in the same
+/// directory only reads `HEAD` instead of walking the tree.
+pub fn git_branch(sh: &mut Shell, cwd: &str) -> Option<String> {
+    let gd_env = sh.get("GIT_DIR").filter(|s| !s.is_empty());
+    let hit = match &sh.git_cache {
+        Some((c, g, Some(_))) if c == cwd && *g == gd_env => true,
+        Some((c, g, None)) if c == cwd && *g == gd_env => {
+            // Negative result: trust it only while `cwd` still has no `.git`, so
+            // a fresh `git init` is picked up on the next prompt.
+            gd_env.is_none() && !std::path::Path::new(cwd).join(".git").exists()
+        }
+        _ => false,
+    };
+    if !hit {
+        let d = match &gd_env {
+            Some(gd) => {
+                let p = std::path::PathBuf::from(gd);
+                let abs = if p.is_absolute() { p } else { std::path::PathBuf::from(cwd).join(p) };
+                Some(abs.to_string_lossy().into_owned())
+            }
+            None => find_git_dir(cwd),
+        };
+        sh.git_cache = Some((cwd.to_string(), gd_env, d));
+    }
+    let dir = sh.git_cache.as_ref().and_then(|(_, _, d)| d.as_deref())?;
+    let head = match std::fs::read_to_string(std::path::Path::new(dir).join("HEAD")) {
+        Ok(h) => h,
+        Err(_) => {
+            // Repository moved or disappeared; force a fresh lookup next time.
+            sh.git_cache = None;
+            return None;
+        }
+    };
+    let head = head.trim();
+    Some(match head.strip_prefix("ref: refs/heads/") {
+        Some(b) => b.to_string(),
+        None => head.chars().take(7).collect(),
+    })
 }
 
 fn tilde(sh: &mut Shell, p: &str) -> String {
@@ -151,11 +188,18 @@ pub fn expand_prompt(sh: &mut Shell, ps: &str) -> String {
             'v' | 'V' => out.push_str(env!("CARGO_PKG_VERSION")),
             'g' => {
                 let cwd = sh.cwd();
-                if let Some(b) = git_branch(&cwd) {
+                if let Some(b) = git_branch(sh, &cwd) {
                     out.push_str(&protect(&b));
                 }
             }
             '?' => out.push_str(&sh.last_status.to_string()),
+            'P' => {
+                if let Some(v) = sh.var("PIPESTATUS") {
+                    if let Val::Arr(a) = &v.val {
+                        out.push_str(&protect(&a.join("|")));
+                    }
+                }
+            }
             'L' => {
                 if sh.last_duration_ms >= 1000 {
                     out.push_str(&fmt_duration(sh.last_duration_ms));
@@ -204,7 +248,7 @@ pub fn default_prompt(sh: &mut Shell) -> String {
         s.push_str(&format!("\x1b[33m{}@{}\x1b[0m ", sh.get("USER").unwrap_or_default(), sys::hostname().split('.').next().unwrap_or("")));
     }
     s.push_str(&format!("\x1b[1;34m{}\x1b[0m", tilde(sh, &cwd)));
-    if let Some(b) = git_branch(&cwd) {
+    if let Some(b) = git_branch(sh, &cwd) {
         s.push_str(&format!(" \x1b[35m({})\x1b[0m", b));
     }
     if !sh.jobs.is_empty() {
@@ -226,4 +270,22 @@ pub fn default_prompt(sh: &mut Shell) -> String {
     };
     s.push_str(&format!(" {}{}\x1b[0m ", if sh.last_status == 0 { "\x1b[32m" } else { "\x1b[31m" }, sym));
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn git_init_after_negative_cache() {
+        let base = std::env::temp_dir().join(format!("nash-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let cwd = base.to_str().unwrap().to_string();
+        let mut sh = Shell::new();
+        assert_eq!(git_branch(&mut sh, &cwd), None, "empty dir");
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::write(base.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(git_branch(&mut sh, &cwd).as_deref(), Some("main"), "after init");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

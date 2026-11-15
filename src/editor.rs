@@ -726,6 +726,20 @@ impl<'a> Editor<'a> {
         out
     }
 
+    /// Variables that can follow `$`/`${`: shell variables plus special
+    /// parameters and dynamically computed variables that never live in scopes.
+    fn var_candidates(&mut self, prefix: &str) -> Vec<String> {
+        const SPECIAL: &[&str] = &[
+            "?", "$", "!", "#", "@", "*", "-", "_", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "RANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME", "LINENO", "FUNCNAME", "PIPESTATUS",
+        ];
+        let mut names = self.sh.var_names();
+        names.extend(SPECIAL.iter().map(|s| s.to_string()));
+        names.retain(|n| n.starts_with(prefix));
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn candidates(&mut self, before: &str, word: &str, quote: Option<char>) -> Vec<Cand> {
         let raw = match quote {
             Some(_) => word.chars().skip(1).collect::<String>(),
@@ -733,8 +747,7 @@ impl<'a> Editor<'a> {
         };
         if quote != Some('\'') && raw.starts_with('$') && !raw.contains('/') {
             let (pre, name, post) = if let Some(n) = raw.strip_prefix("${") { ("${", n, "}") } else { ("$", &raw[1..], "") };
-            let mut names: Vec<String> = self.sh.all_vars().into_iter().map(|(n, _)| n).filter(|n| n.starts_with(name)).collect();
-            names.sort();
+            let names = self.var_candidates(name);
             let q = quote.map(|q| q.to_string()).unwrap_or_default();
             return names.into_iter().map(|n| Cand { text: format!("{}{}{}{}", q, pre, n, post), display: n, dir: false, color: "36".to_string() }).collect();
         }
@@ -761,7 +774,7 @@ impl<'a> Editor<'a> {
                     dirs_only = true;
                     None
                 }
-                "unset" | "export" | "readonly" | "declare" | "local" | "typeset" => Some(self.sh.all_vars().into_iter().map(|(n, _)| n).collect()),
+                "unset" | "export" | "readonly" | "declare" | "local" | "typeset" => Some(self.sh.var_names()),
                 "unalias" => Some(self.sh.aliases.keys().cloned().collect()),
                 "type" | "which" | "man" | "hash" | "whereis" => Some(self.sh.command_names()),
                 "kill" if raw.starts_with('-') => Some(sys::SIGNALS.iter().map(|(n, _)| format!("-{}", n)).collect()),

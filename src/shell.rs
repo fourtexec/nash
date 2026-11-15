@@ -184,17 +184,24 @@ pub struct Shell {
     home_dir: Option<String>,
     /// Lazily resolved username (resolved on first access to avoid getpwuid syscall at startup).
     user_name: Option<String>,
+    /// Cache of the resolved git directory for the last prompt's cwd and
+    /// `GIT_DIR`, so the common case only reads `HEAD` instead of walking the
+    /// tree. `None` in the last slot means "not inside a repository".
+    pub(crate) git_cache: Option<(String, Option<String>, Option<String>)>,
 }
 
 impl Shell {
     pub fn new() -> Shell {
         let pid = unsafe { libc::getpid() };
 
-        // Only read PATH from env — do NOT load all vars (expensive syscall per var).
+        // Import the environment in a single pass. Doing it once is cheap, and
+        // it makes `$VAR`, `$<TAB>`, prompt escapes and child processes all see
+        // the variables the shell was started with.
         let mut global = HashMap::new();
-        if let Ok(p) = std::env::var("PATH") {
-            if crate::parser::is_name("PATH") {
-                global.insert("PATH".to_string(), Var { val: Val::Str(p), exported: true, readonly: false });
+        for (k, v) in std::env::vars_os() {
+            let (Some(k), Some(v)) = (k.to_str(), v.to_str()) else { continue };
+            if crate::parser::is_name(k) {
+                global.insert(k.to_string(), Var { val: Val::Str(v.to_string()), exported: true, readonly: false });
             }
         }
         let mut sh = Shell {
@@ -243,26 +250,32 @@ impl Shell {
             procsubst_fds: Vec::new(),
             home_dir: None,
             user_name: None,
+            git_cache: None,
         };
         // PWD — needed for autocd and relative path resolution.
         let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
         let _ = sh.set_str("PWD", cwd);
         sh.export_var("PWD");
 
-        // HOME and USER from env if present, otherwise resolve lazily via getpwuid.
-        if let Ok(h) = std::env::var("HOME") {
-            if crate::parser::is_name("HOME") {
-                let _ = sh.set_str("HOME", h.clone());
-                sh.export_var("HOME");
-                sh.home_dir = Some(h);
-            }
+        // Like bash/zsh, never inherit a custom IFS. Reset it to the default,
+        // keeping the exported flag if it happened to be exported.
+        let _ = sh.set_str("IFS", " \t\n");
+
+        // Prime the HOME/USER caches from the imported environment, but keep
+        // the lazy getpwuid fallback for shells started without them.
+        let home = match sh.var("HOME") {
+            Some(Var { val: Val::Str(h), .. }) => Some(h.clone()),
+            _ => None,
+        };
+        if let Some(h) = home {
+            sh.home_dir = Some(h);
         }
-        if let Ok(u) = std::env::var("USER") {
-            if crate::parser::is_name("USER") {
-                let _ = sh.set_str("USER", u.clone());
-                sh.export_var("USER");
-                sh.user_name = Some(u);
-            }
+        let user = match sh.var("USER") {
+            Some(Var { val: Val::Str(u), .. }) => Some(u.clone()),
+            _ => None,
+        };
+        if let Some(u) = user {
+            sh.user_name = Some(u);
         }
 
         let lvl = sh.get("SHLVL").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) + 1;
@@ -271,8 +284,12 @@ impl Shell {
         let _ = sh.set_str("PPID", unsafe { libc::getppid() }.to_string());
         let _ = sh.set_str("NASH_VERSION", crate::version());
         let _ = sh.set_str("OPTIND", "1");
-        let _ = sh.set_str("PS2", "… ");
-        let _ = sh.set_str("PS4", "+ ");
+        if sh.get("PS2").is_none() {
+            let _ = sh.set_str("PS2", "… ");
+        }
+        if sh.get("PS4").is_none() {
+            let _ = sh.set_str("PS4", "+ ");
+        }
         let _ = sh.set_str("HOSTNAME", sys::hostname());
         let exe = sh.self_exe.clone();
         let _ = sh.set_str("SHELL", exe);

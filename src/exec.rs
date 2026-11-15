@@ -1403,6 +1403,20 @@ impl Shell {
         map.into_iter().collect()
     }
 
+    /// Names of all visible variables, sorted and without cloning their values.
+    /// Used by completion, where only the names matter.
+    pub fn var_names(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for s in &self.scopes {
+            for (k, v) in s {
+                if !matches!(v.val, Val::Unset) {
+                    set.insert(k.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
     fn exec_decl(&mut self, cmd: &str, sc: &SimpleCmd) -> R {
         enum Item<'a> {
             A(&'a Assign),

@@ -440,7 +440,8 @@ nash additions:
   syntax highlighting, autosuggestions, menu completion, `did you mean' hints
 
 Prompt escapes (PS1/RPROMPT): bash's \\u \\h \\w \\W \\$ \\t ... plus
-  \\g git branch, \\? last exit status, \\L duration of the last command.
+  \\g git branch, \\? last exit status, \\P pipeline statuses (a|b|c),
+  \\L duration of the last command.
 
 Builtins:";
 

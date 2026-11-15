@@ -184,8 +184,10 @@ press → or End to accept it, Alt-F to accept one word.
 
 **The prompt.** With no `PS1` set you get the directory, git branch, running
 jobs, duration of slow commands and the exit status of failed ones. Custom
-prompts can use bash escapes plus `\g` (git branch), `\?` (exit status) and
-`\L` (duration of the last command), and `RPROMPT` for the right-hand side.
+prompts can use bash escapes plus `\g` (git branch), `\?` (exit status),
+`\P` (pipeline statuses, e.g. `1|0`), and `\L` (duration of the last command),
+and `RPROMPT` for the right-hand side. The git branch lookup is cached per
+directory, so it stays cheap even in deep trees.
 
 ## Line editor keys
 
@@ -205,9 +207,12 @@ prompts can use bash escapes plus `\g` (git branch), `\?` (exit status) and
 An unfinished command (open quote, `if` without `fi`, trailing `|` …) simply
 continues on the next line; the whole command is edited and recalled as one.
 
-Completion knows commands, files, variables (`$HO<Tab>`), options for `set -o`,
-git subcommands and branches, cargo subcommands, and anything registered with
-`complete -W "words…" command`.
+Completion knows commands, files, variables and special parameters
+(`$HO<Tab>`, `${PA<Tab>`, `$?<Tab>`), options for `set -o`, git subcommands and
+branches, cargo subcommands, and anything registered with
+`complete -W "words…" command`. The shell imports its environment once at
+startup, so `$TERM`, `$LANG`, `$EDITOR` and friends are available and are passed
+on to child processes.
 
 ## Files
 
