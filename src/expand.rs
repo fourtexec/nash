@@ -558,48 +558,124 @@ impl Shell {
     }
 
     pub fn set_elem(&mut self, name: &str, idx: &str, val: String, append: bool) -> Result<(), Flow> {
-        let cur = self.var(name).map(|v| v.val.clone());
-        let new = match cur {
-            Some(Val::Map(mut m)) => {
-                let key = self.expand_string(idx)?;
-                match m.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, v)) => {
-                        if append {
-                            v.push_str(&val)
-                        } else {
-                            *v = val
+        // Map case needs idx expansion; handle first.
+        let is_map = matches!(self.var(name).map(|v| &v.val), Some(Val::Map(_)));
+        if is_map {
+            let key = self.expand_string(idx)?;
+            if let Some(v) = self.var_mut(name) {
+                if v.readonly {
+                    return self.fail(format!("{}: readonly variable", name));
+                }
+                if let Val::Map(m) = &mut v.val {
+                    match m.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, vv)) => {
+                            if append {
+                                vv.push_str(&val)
+                            } else {
+                                *vv = val
+                            }
                         }
+                        None => m.push((key, val)),
                     }
-                    None => m.push((key, val)),
+                    return Ok(());
                 }
-                Val::Map(m)
             }
-            other => {
-                let mut a = match other {
-                    Some(Val::Arr(a)) => a,
-                    Some(Val::Str(s)) => vec![s],
-                    _ => Vec::new(),
-                };
-                let mut i = self.arith(idx)?.as_i();
-                if i < 0 {
-                    i += a.len() as i64;
-                }
-                if !(0..=10_000_000).contains(&i) {
-                    return self.fail(format!("{}[{}]: bad array subscript", name, idx));
-                }
-                let i = i as usize;
-                while a.len() <= i {
-                    a.push(String::new());
-                }
-                if append {
-                    a[i].push_str(&val)
-                } else {
-                    a[i] = val
-                }
-                Val::Arr(a)
+            return self.fail(format!("{}: bad array subscript", name));
+        }
+
+        // Arithmetic index (may expand idx).
+        let i = self.arith(idx)?.as_i();
+
+        // Try to mutate an existing variable in place (no full-array clone).
+        if let Some(v) = self.var_mut(name) {
+            if v.readonly {
+                return self.fail(format!("{}: readonly variable", name));
             }
-        };
-        match self.set(name, new) {
+            match &mut v.val {
+                Val::Arr(a) => {
+                    let mut ii = i;
+                    if ii < 0 {
+                        ii += a.len() as i64;
+                    }
+                    if !(0..=10_000_000).contains(&ii) {
+                        return self.fail(format!("{}[{}]: bad array subscript", name, idx));
+                    }
+                    let ii = ii as usize;
+                    while a.len() <= ii {
+                        a.push(String::new());
+                    }
+                    if append {
+                        a[ii].push_str(&val);
+                    } else {
+                        a[ii] = val;
+                    }
+                    return Ok(());
+                }
+                Val::Str(s) => {
+                    let mut a = vec![s.clone()];
+                    let mut ii = i;
+                    if ii < 0 {
+                        ii += a.len() as i64;
+                    }
+                    if !(0..=10_000_000).contains(&ii) {
+                        return self.fail(format!("{}[{}]: bad array subscript", name, idx));
+                    }
+                    let ii = ii as usize;
+                    while a.len() <= ii {
+                        a.push(String::new());
+                    }
+                    if append {
+                        a[ii].push_str(&val);
+                    } else {
+                        a[ii] = val;
+                    }
+                    v.val = Val::Arr(a);
+                    return Ok(());
+                }
+                Val::Unset => {
+                    let mut a = Vec::new();
+                    let mut ii = i;
+                    if ii < 0 {
+                        ii += a.len() as i64;
+                    }
+                    if !(0..=10_000_000).contains(&ii) {
+                        return self.fail(format!("{}[{}]: bad array subscript", name, idx));
+                    }
+                    let ii = ii as usize;
+                    while a.len() <= ii {
+                        a.push(String::new());
+                    }
+                    if append {
+                        a[ii].push_str(&val);
+                    } else {
+                        a[ii] = val;
+                    }
+                    v.val = Val::Arr(a);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // Variable does not exist: create in innermost scope.
+        let mut a = Vec::new();
+        let mut ii = i;
+        if ii < 0 {
+            ii += a.len() as i64;
+        }
+        if !(0..=10_000_000).contains(&ii) {
+            return self.fail(format!("{}[{}]: bad array subscript", name, idx));
+        }
+        let ii = ii as usize;
+        while a.len() <= ii {
+            a.push(String::new());
+        }
+        if append {
+            a[ii].push_str(&val);
+        } else {
+            a[ii] = val;
+        }
+        match self.set(name, Val::Arr(a)) {
             Ok(()) => Ok(()),
             Err(e) => self.fail(e),
         }
@@ -891,6 +967,34 @@ impl Shell {
                 self.store(&a.name, new, local)
             }
             AssignVal::Array(elems) => {
+                // Fast path for simple append (a+=(...)): mutate in place instead
+                // of cloning the whole array on every assignment.
+                if a.append && elems.iter().all(|(k, _)| k.is_none()) {
+                    if local && !self.scopes.last().unwrap().contains_key(&a.name) {
+                        let _ = self.set_local(&a.name, Val::Arr(Vec::new()));
+                    } else if self.var(&a.name).is_none() {
+                        let _ = self.set(&a.name, Val::Arr(Vec::new()));
+                    }
+                    if let Some(v) = self.var_mut(&a.name) {
+                        if let Val::Str(s) = &v.val {
+                            let s = s.clone();
+                            v.val = Val::Arr(vec![s]);
+                        }
+                        if !matches!(v.val, Val::Arr(_)) {
+                            v.val = Val::Arr(Vec::new());
+                        }
+                    }
+                    let mut new_items = Vec::new();
+                    for (_, w) in elems {
+                        self.expand_word_into(w, &mut new_items)?;
+                    }
+                    if let Some(v) = self.var_mut(&a.name) {
+                        if let Val::Arr(arr) = &mut v.val {
+                            arr.extend(new_items);
+                            return Ok(());
+                        }
+                    }
+                }
                 let cur = self.var(&a.name).map(|v| v.val.clone());
                 let is_map = force_map || (matches!(cur, Some(Val::Map(_))) && !local) || (matches!(cur, Some(Val::Map(_))) && self.scopes.last().unwrap().contains_key(&a.name));
                 if is_map {
