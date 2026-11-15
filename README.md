@@ -52,12 +52,11 @@ subcommand, run a script that happens to be called `install` as `nash ./install`
 nash update
 ```
 
-installs the newest stable release. nash reads the release manifest at
-<https://fourtexec.site/nash/manifest.json>, takes the newest release that has
-a binary tagged with your platform (`linux`, `macos` or `android`; `amd64` or
-`arm64`), downloads it with curl or wget, checks its SHA-256 and that it runs
-here, and then replaces the binary you are running (use `sudo` if it lives in
-`/usr/local/bin`).
+installs the newest stable release. nash asks GitHub for the releases of
+`fourtexec/nash`, takes from the release the binary named after your platform
+(`nash-<os>-<cpu>`, for example `nash-linux-x86_64`), downloads it with curl or
+wget, checks its SHA-256 and that it runs here, and then replaces the binary
+you are running (use `sudo` if it lives in `/usr/local/bin`).
 
 ```bash
 nash update dev
@@ -80,13 +79,16 @@ must be built for this operating system and CPU, run here and report itself as
 nash. As with `install`, run a script called `update` as `nash ./update`.
 
 Releases are made by the workflow in `.github/workflows/release.yml`: every
-push to `main` is a development build tagged `dev1`, `dev2`, `dev3`, ..., and
-pushing a tag `v1.2.3` publishes the stable release `1.2.3`. The same workflow
-then updates [fourtexec.site](https://fourtexec.site): the manifest and the nash
-project page with the newest releases and changes. That step needs the
-`SITE_TOKEN` secret (a fine-grained token with "Contents: read and write" on
-`fourtexec/fourtexec.github.io`); without it the site notices the release by
-itself within half an hour.
+push to `main` is a development build tagged `dev1`, `dev2`, `dev3`, ... and
+marked as a pre-release, and pushing a tag `v1.2.3` publishes the stable release
+`1.2.3`. Every release carries the same files, one binary per platform and
+`SHA256SUMS`, which is all `nash update` needs.
+
+The same workflow then updates the nash page of
+[fourtexec.site](https://fourtexec.site) with the newest releases and changes.
+That step needs the `SITE_TOKEN` secret (a fine-grained token with "Contents:
+read and write" on `fourtexec/fourtexec.github.io`); without it the site notices
+the release by itself within half an hour.
 
 ## What you get
 

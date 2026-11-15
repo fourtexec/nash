@@ -1,11 +1,12 @@
-//! `nash update`: look up a release in the manifest on fourtexec.site,
-//! download the binary built for this platform and replace the running one.
+//! `nash update`: find a release of fourtexec/nash on GitHub, download the
+//! binary built for this platform and replace the running one.
 //!
-//! The manifest (JSON) lists releases, newest first within a channel
-//! (`stable` or `dev`). Each release has binaries tagged with the platform
-//! they are for (`linux`/`macos`/`android`, `amd64`/`arm64`), a download link
-//! and a SHA-256. Files are fetched with curl or wget, so nash itself needs
-//! no network code.
+//! Every release carries the same files: one binary per platform, named
+//! `nash-<os>-<cpu>` (`nash-linux-x86_64`, ...), and `SHA256SUMS`. A stable
+//! release is tagged `v1.2.3`, a development build `dev7` (and is marked as
+//! a pre-release, so GitHub's "latest release" is always a stable one). The
+//! GitHub API says which releases exist and where their files are; they are
+//! fetched with curl or wget, so nash itself needs no network code.
 //!
 //! `nash update PATH` installs a binary the user already has instead.
 
@@ -14,15 +15,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-const DEFAULT_URL: &str = "https://fourtexec.site/nash/manifest.json";
+const DEFAULT_URL: &str = "https://api.github.com/repos/fourtexec/nash";
 
 const HELP: &str = "\
 usage: nash update [--check] [--force] [--list] [dev | stable | VERSION]
        nash update [--check] PATH
 
-Updates nash from the release manifest on fourtexec.site:
-  1. reads the manifest and picks a release that has a binary for this
-     platform (operating system and CPU)
+Updates nash from the releases of fourtexec/nash on GitHub:
+  1. finds the release and, in it, the binary for this platform
+     (nash-<os>-<cpu>, for example nash-linux-x86_64)
   2. downloads that binary and verifies its checksum
   3. replaces the nash binary that is running
 
@@ -33,9 +34,10 @@ Updates nash from the release manifest on fourtexec.site:
   --check   only report whether the update would change anything
             (exit status 0: up to date, 1: update available)
   --force   reinstall even if this version is already installed
-  --list    list the releases available for this platform
+  --list    list the recent releases available for this platform
 
-Needs curl or wget. NASH_UPDATE_URL overrides the manifest location.
+Needs curl or wget. NASH_UPDATE_URL overrides the address of the GitHub API
+of the repository.
 
 With a PATH (an argument with a `/' in it, such as ./nash-linux-x86_64)
 nothing is downloaded: the nash binary at PATH is checked the same way (built
@@ -47,23 +49,23 @@ fn has(cmd: &str) -> bool {
     Command::new("sh").args(["-c", &format!("command -v {} >/dev/null 2>&1", cmd)]).status().map(|s| s.success()).unwrap_or(false)
 }
 
-/// The tags a binary for this platform may carry: (operating system, CPU).
-fn platform() -> Option<(&'static [&'static str], &'static [&'static str])> {
-    let os: &[&str] = match std::env::consts::OS {
-        "linux" => &["linux"],
-        "macos" => &["macos", "darwin"],
-        "android" => &["android", "termux"],
+/// The file of a release built for the platform this binary was compiled for.
+fn asset_name() -> Option<String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "android" => "android",
         _ => return None,
     };
-    let arch: &[&str] = match std::env::consts::ARCH {
-        "x86_64" => &["amd64", "amd", "x86_64", "x64"],
-        "aarch64" => &["arm64", "arm", "aarch64"],
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
         _ => return None,
     };
-    Some((os, arch))
+    Some(format!("nash-{}-{}", os, arch))
 }
 
-/// A parsed JSON value; just enough for the manifest.
+/// A parsed JSON value; just enough for the answers of the GitHub API.
 #[derive(Debug, PartialEq)]
 enum Json {
     Null,
@@ -231,43 +233,69 @@ fn parse_json(text: &str) -> Option<Json> {
     (p.i == p.s.len()).then_some(v)
 }
 
-/// A binary of a release that runs on this platform.
+/// A release that has a binary for this platform.
 #[derive(Debug, PartialEq)]
 struct Build {
+    /// `0.1.1` or `dev7`
     version: String,
-    channel: String,
-    name: String,
+    /// `stable` or `dev`, by the name of the tag
+    channel: &'static str,
+    /// where the binary is
     url: String,
-    sha256: String,
+    /// its SHA-256 as GitHub recorded it, if it did
+    sha256: Option<String>,
+    /// where SHA256SUMS of the release is, if it has one
+    sums_url: Option<String>,
 }
 
-/// The releases of the manifest that have a binary for the platform, in
-/// manifest order (newest first within a channel). A binary fits when all of
-/// its tags name this platform and it names both the OS and the CPU.
-fn builds(manifest: &Json, os: &[&str], arch: &[&str]) -> Vec<Build> {
-    let mut found = Vec::new();
-    for release in manifest.arr("releases") {
-        let (version, channel) = match (release.str("version"), release.str("channel")) {
-            (Some(v), Some(c)) => (v, c),
-            _ => continue,
-        };
-        for binary in release.arr("binaries") {
-            let tags: Vec<String> = binary.arr("tags").iter().filter_map(|t| if let Json::Str(s) = t { Some(s.to_lowercase()) } else { None }).collect();
-            let is = |set: &[&str], t: &String| set.contains(&t.as_str());
-            let fits = tags.iter().all(|t| is(os, t) || is(arch, t)) && tags.iter().any(|t| is(os, t)) && tags.iter().any(|t| is(arch, t));
-            if let (true, Some(url), Some(sha256)) = (fits, binary.str("url"), binary.str("sha256")) {
-                found.push(Build {
-                    version: version.trim_start_matches('v').to_string(),
-                    channel: channel.to_string(),
-                    name: binary.str("name").unwrap_or("nash").to_string(),
-                    url: url.to_string(),
-                    sha256: sha256.to_lowercase(),
-                });
-                break;
-            }
-        }
+/// What a release of the GitHub API offers for `asset`. None: a draft, a
+/// tag that is not a version, or no such file in the release.
+fn build_of(release: &Json, asset: &str) -> Option<Build> {
+    if release.get("draft") == Some(&Json::Bool(true)) {
+        return None;
     }
+    let tag = release.str("tag_name")?;
+    let (version, channel) = if dev_number(tag).is_some() {
+        (tag, "dev")
+    } else {
+        let v = tag.strip_prefix('v')?;
+        parse_version(v)?;
+        (v, "stable")
+    };
+    let file = |name: &str| release.arr("assets").iter().find(|a| a.str("name") == Some(name) && a.str("state").unwrap_or("uploaded") == "uploaded");
+    let binary = file(asset)?;
+    let digest = binary.str("digest").and_then(|d| d.strip_prefix("sha256:")).filter(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit()));
+    Some(Build {
+        version: version.to_string(),
+        channel,
+        url: binary.str("browser_download_url")?.to_string(),
+        sha256: digest.map(|h| h.to_lowercase()),
+        sums_url: file("SHA256SUMS").and_then(|a| a.str("browser_download_url")).map(|u| u.to_string()),
+    })
+}
+
+/// The releases of a listing that have a binary for this platform: stable
+/// ones first, each channel newest first by number (not by date).
+fn builds(listing: &Json, asset: &str) -> Vec<Build> {
+    let mut found: Vec<Build> = match listing {
+        Json::Arr(releases) => releases.iter().filter_map(|r| build_of(r, asset)).collect(),
+        _ => Vec::new(),
+    };
+    found.sort_by(|a, b| {
+        let key = |x: &Build| (x.channel == "stable", parse_version(&x.version), dev_number(&x.version));
+        key(b).cmp(&key(a))
+    });
     found
+}
+
+/// The hash of `asset` in the text of a SHA256SUMS file.
+fn checksum_in(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        let hash = it.next()?;
+        let name = it.next()?.trim_start_matches('*');
+        (name == asset && hash.len() == 64).then(|| hash.to_lowercase())
+    })
 }
 
 /// `dev12` -> 12.
@@ -553,13 +581,15 @@ pub fn update(args: &[String]) -> i32 {
     }
     let current = crate::version();
     let url = std::env::var("NASH_UPDATE_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| DEFAULT_URL.to_string());
-    let (os, arch) = match platform() {
-        Some(p) => p,
+    let url = url.trim_end_matches('/');
+    let asset = match asset_name() {
+        Some(a) => a,
         None => {
             err!("nash update: no release binaries for {}-{}; build from source instead\n", std::env::consts::OS, std::env::consts::ARCH);
             return 1;
         }
     };
+    let asset = asset.as_str();
     let fetch = match Fetcher::new() {
         Some(f) => f,
         None => {
@@ -567,54 +597,69 @@ pub fn update(args: &[String]) -> i32 {
             return 1;
         }
     };
-
-    // 1. the manifest, and the release asked for
-    let manifest = match fetch.text(&url) {
-        Ok(text) => match parse_json(&text) {
-            Some(m) => m,
-            None => {
-                err!("nash update: {} is not a release manifest\n", url);
-                return 1;
-            }
-        },
-        Err(e) => {
-            err!("nash update: cannot download the release manifest: {}\n", e);
-            return 1;
-        }
+    let get = |what: &str| -> Result<Json, String> {
+        let text = fetch.text(&format!("{}/{}", url, what))?;
+        parse_json(&text).ok_or_else(|| "GitHub did not answer with a list of releases".to_string())
     };
-    let available = builds(&manifest, os, arch);
+    // The newest releases of the repository, for `dev' and `--list'.
+    let recent = || get("releases?per_page=100").map(|listing| builds(&listing, asset));
+    let unreachable = |e: String| -> i32 {
+        err!("nash update: cannot ask GitHub for the releases: {}\n", e);
+        1
+    };
+
     if list {
-        for b in &available {
-            out!("{:<12} {}{}\n", b.version, b.channel, if b.version == current { "  (installed)" } else { "" });
-        }
-        return 0;
+        return match recent() {
+            Ok(available) => {
+                for b in &available {
+                    out!("{:<12} {}{}\n", b.version, b.channel, if b.version == current { "  (installed)" } else { "" });
+                }
+                0
+            }
+            Err(e) => unreachable(e),
+        };
     }
-    // `nash update` and `nash update dev` take the newest of a channel and
-    // never go back to an older one; a version by name is taken as it is.
+
+    // 1. the release asked for. `nash update` and `nash update dev` take the
+    //    newest of a channel and never go back to an older one; a version by
+    //    name is taken as it is.
     let channel = match want {
         None | Some("stable") => Some("stable"),
         Some("dev") => Some("dev"),
         Some(_) => None,
     };
-    let build = match channel {
-        Some(c) => available.iter().find(|b| b.channel == c),
-        None => {
-            let v = want.unwrap_or("").trim_start_matches('v');
-            available.iter().find(|b| b.version == v)
+    let found = match (channel, want) {
+        // GitHub's "latest release" is the newest that is not a pre-release;
+        // if that one has nothing for this platform, the newest that has.
+        (Some("stable"), _) => match get("releases/latest").ok().and_then(|r| build_of(&r, asset)).filter(|b| b.channel == "stable") {
+            Some(b) => Ok(Some(b)),
+            None => recent().map(|all| all.into_iter().find(|b| b.channel == "stable")),
+        },
+        (Some(_), _) => recent().map(|all| all.into_iter().find(|b| b.channel == "dev")),
+        (None, Some(name)) => {
+            let name = name.strip_prefix('v').unwrap_or(name);
+            if dev_number(name).is_none() && parse_version(name).is_none() {
+                err!("nash update: `{}' is not a version (0.1.0, dev7), `dev' or `stable'\n", name);
+                return 2;
+            }
+            let tag = if dev_number(name).is_some() { name.to_string() } else { format!("v{}", name) };
+            // a release that does not exist is an error of the download
+            Ok(get(&format!("releases/tags/{}", tag)).ok().and_then(|r| build_of(&r, asset)))
         }
+        (None, None) => Ok(None),
     };
-    let build = match build {
-        Some(b) => b,
-        None => {
+    let build = match found {
+        Ok(Some(b)) => b,
+        Ok(None) => {
             match channel {
-                Some(c) => err!("nash update: no {} release for {}/{} in the manifest\n", c, os[0], arch[0]),
-                None => err!("nash update: no release `{}' for {}/{}; see `nash update --list'\n", want.unwrap_or(""), os[0], arch[0]),
+                Some(c) => err!("nash update: no {} release with {} yet\n", c, asset),
+                None => err!("nash update: no release `{}' with {}; see `nash update --list'\n", want.unwrap_or(""), asset),
             }
             return 1;
         }
+        Err(e) => return unreachable(e),
     };
     let latest = build.version.as_str();
-    let asset = build.name.as_str();
     let up_to_date = match channel {
         Some(_) => not_older(current, latest),
         None => current == latest,
@@ -660,7 +705,17 @@ pub fn update(args: &[String]) -> i32 {
     }
 
     // 3. verify: checksum, then make sure it really runs as nash
-    let want = build.sha256.clone();
+    let want = match (&build.sha256, &build.sums_url) {
+        (Some(h), _) => h.clone(),
+        (None, Some(sums)) => match fetch.text(sums) {
+            Ok(text) => match checksum_in(&text, asset) {
+                Some(h) => h,
+                None => return fail(format!("SHA256SUMS of {} has no entry for {}", latest, asset)),
+            },
+            Err(e) => return fail(format!("cannot download SHA256SUMS: {}", e)),
+        },
+        (None, None) => return fail(format!("release {} has no checksum for {}", latest, asset)),
+    };
     match sha256(&tmp) {
         Some(got) if got == want => {}
         Some(got) => return fail(format!("checksum mismatch for {} (expected {}, got {})", asset, want, got)),
@@ -722,33 +777,63 @@ mod tests {
         }
     }
 
-    const MANIFEST: &str = r#"{"schema": 1, "releases": [
-        {"version": "0.2.0", "channel": "stable", "binaries": [
-            {"tags": ["macos", "arm64"], "name": "m", "url": "https://x/020-mac", "sha256": "AA"}]},
-        {"version": "v0.1.0", "channel": "stable", "binaries": [
-            {"tags": ["linux", "arm64"], "name": "a", "url": "https://x/010-arm", "sha256": "bb"},
-            {"tags": ["linux", "amd64"], "name": "b", "url": "https://x/010-amd", "sha256": "cc"},
-            {"tags": ["linux"], "name": "c", "url": "https://x/010-any", "sha256": "dd"}]},
-        {"version": "dev7", "channel": "dev", "binaries": [
-            {"tags": ["Linux", "x86_64"], "url": "https://x/dev7", "sha256": "ee"},
-            {"tags": ["linux", "amd64", "musl-only"], "url": "https://x/no", "sha256": "ff"}]},
-        {"version": "dev6", "channel": "dev", "binaries": [{"tags": ["linux", "amd"], "url": "https://x/nohash"}]}
-    ]}"#;
+const RELEASES: &str = r#"[
+        {"tag_name": "dev9", "prerelease": true, "assets": [
+            {"name": "nash-linux-x86_64", "browser_download_url": "https://x/dev9/nash-linux-x86_64"},
+            {"name": "SHA256SUMS", "browser_download_url": "https://x/dev9/SHA256SUMS"}]},
+        {"tag_name": "v9.0.0", "draft": true, "assets": [
+            {"name": "nash-linux-x86_64", "browser_download_url": "https://x/draft"}]},
+        {"tag_name": "v0.1.1", "assets": [
+            {"name": "nash-macos-aarch64", "browser_download_url": "https://x/011-mac",
+             "digest": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]},
+        {"tag_name": "dev10", "prerelease": true, "assets": [
+            {"name": "nash-linux-x86_64", "browser_download_url": "https://x/dev10/nash-linux-x86_64", "digest": "sha256:short"},
+            {"name": "nash-linux-aarch64", "state": "starter", "browser_download_url": "https://x/half"}]},
+        {"tag_name": "v0.1.0", "assets": [
+            {"name": "nash-linux-x86_64", "state": "uploaded", "browser_download_url": "https://x/010",
+             "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]},
+        {"tag_name": "v0.1.0.7", "assets": [
+            {"name": "nash-linux-x86_64", "browser_download_url": "https://x/0107"}]},
+        {"tag_name": "nightly", "assets": [{"name": "nash-linux-x86_64", "browser_download_url": "https://x/n"}]},
+        {"tag_name": "v.4", "assets": [{"name": "nash-linux-x86_64", "browser_download_url": "https://x/v4"}]}
+    ]"#;
 
     #[test]
-    fn picks_binaries_by_tags() {
-        let m = parse_json(MANIFEST).unwrap();
-        let linux = builds(&m, &["linux"], &["amd64", "amd", "x86_64"]);
-        let got: Vec<(&str, &str, &str)> = linux.iter().map(|b| (b.version.as_str(), b.channel.as_str(), b.url.as_str())).collect();
-        // 0.2.0 has nothing for linux, so the newest stable here is 0.1.0
-        assert_eq!(got, [("0.1.0", "stable", "https://x/010-amd"), ("dev7", "dev", "https://x/dev7")]);
-        assert_eq!(linux[0].sha256, "cc");
-        assert_eq!(linux[1].name, "nash");
-        let mac = builds(&m, &["macos", "darwin"], &["arm64", "arm", "aarch64"]);
+    fn picks_releases_with_the_binary() {
+        let listing = parse_json(RELEASES).unwrap();
+        let linux = builds(&listing, "nash-linux-x86_64");
+        let got: Vec<(&str, &str, &str)> = linux.iter().map(|b| (b.version.as_str(), b.channel, b.url.as_str())).collect();
+        // stable first, newest first by number: 0.1.1 has nothing for linux,
+        // 0.1.0.7 is newer than 0.1.0, dev10 newer than dev9; drafts and
+        // tags that are not versions are left out
+        assert_eq!(
+            got,
+            [
+                ("0.1.0.7", "stable", "https://x/0107"),
+                ("0.1.0", "stable", "https://x/010"),
+                ("dev10", "dev", "https://x/dev10/nash-linux-x86_64"),
+                ("dev9", "dev", "https://x/dev9/nash-linux-x86_64"),
+            ]
+        );
+        assert_eq!(linux[1].sha256.as_deref(), Some("b".repeat(64).as_str()));
+        // no usable digest: SHA256SUMS of the release, if there is one
+        assert_eq!((linux[2].sha256.as_deref(), linux[2].sums_url.as_deref()), (None, None));
+        assert_eq!((linux[3].sha256.as_deref(), linux[3].sums_url.as_deref()), (None, Some("https://x/dev9/SHA256SUMS")));
+        let mac = builds(&listing, "nash-macos-aarch64");
         assert_eq!(mac.len(), 1);
-        assert_eq!((mac[0].version.as_str(), mac[0].sha256.as_str()), ("0.2.0", "aa"));
-        assert!(builds(&m, &["android"], &["arm64"]).is_empty());
-        assert!(builds(&parse_json("[]").unwrap(), &["linux"], &["amd64"]).is_empty());
+        assert_eq!((mac[0].version.as_str(), mac[0].sha256.clone()), ("0.1.1", Some("a".repeat(64))));
+        // a file that is still being uploaded is not offered
+        assert!(builds(&listing, "nash-linux-aarch64").is_empty());
+        assert!(builds(&parse_json("{\"message\": \"rate limit\"}").unwrap(), "nash-linux-x86_64").is_empty());
+    }
+
+    #[test]
+    fn checksums() {
+        let h = "c".repeat(64);
+        let sums = format!("{}  nash-linux-aarch64\n{} *nash-linux-x86_64\nshort  nash-macos-x86_64\n", "d".repeat(64), h.to_uppercase());
+        assert_eq!(checksum_in(&sums, "nash-linux-x86_64"), Some(h));
+        assert_eq!(checksum_in(&sums, "nash-macos-x86_64"), None);
+        assert_eq!(checksum_in("<html>", "nash-linux-x86_64"), None);
     }
 
     fn elf(class: u8, machine: u16) -> Vec<u8> {
