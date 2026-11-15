@@ -17,6 +17,7 @@ mod history;
 mod parser;
 mod prompt;
 mod shell;
+mod update;
 
 use editor::Input;
 use shell::{Flow, Shell, R};
@@ -37,6 +38,7 @@ options:
   --help        print this help
 
 nash install    install nash and make it your login shell (see `nash install --help')
+nash update     update nash to the newest release from GitHub (see `nash update --help')
 ";
 
 /// Run exit handlers and terminate.
@@ -294,6 +296,9 @@ fn main() {
     let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
     if args.get(1).map(|a| a == "install").unwrap_or(false) {
         std::process::exit(install::install(&args[2..]));
+    }
+    if args.get(1).map(|a| a == "update").unwrap_or(false) {
+        std::process::exit(update::update(&args[2..]));
     }
     let mut sh = Shell::new();
     let mut command: Option<String> = None;

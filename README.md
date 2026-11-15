@@ -36,6 +36,24 @@ It prints the command that undoes the change. Options: `--prefix DIR` installs
 into `DIR/bin`, `--no-chsh` installs the binary only. Because `install` is a
 subcommand, run a script that happens to be called `install` as `nash ./install`.
 
+## Update
+
+```bash
+nash update
+```
+
+This downloads the newest release from
+[GitHub releases](https://github.com/fourtexec/nash/releases), verifies its
+SHA-256 checksum and replaces the nash binary you are running (use `sudo` if it
+lives in `/usr/local/bin`). `nash update --check` only reports whether a newer
+version exists, `--force` reinstalls the current one. It needs `curl` or `wget`;
+binaries are published for Linux and macOS on x86_64 and aarch64. As with
+`install`, run a script called `update` as `nash ./update`.
+
+To publish a release, bump `version` in `Cargo.toml` and push a matching tag
+(`git tag v0.2.0 && git push origin v0.2.0`); the release workflow builds and
+uploads the binaries.
+
 ## What you get
 
 ### From sh — the whole language

@@ -2678,7 +2678,7 @@ impl Shell {
         let mut resources: Vec<Res> = Vec::new();
         macro_rules! add {
             ($flag:expr, $name:expr, $r:expr) => {
-                resources.push(Res { flag: $flag, name: $name, res: $r });
+                resources.push(Res { flag: $flag, name: $name, res: $r as i32 });
             };
         }
         add!('c', "core file size", libc::RLIMIT_CORE);
