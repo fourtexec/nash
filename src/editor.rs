@@ -704,7 +704,46 @@ impl<'a> Editor<'a> {
                     None
                 }
                 "cargo" if tokens.len() == 1 => Some(CARGO_CMDS.iter().map(|s| s.to_string()).collect()),
-                _ => self.sh.completions.get(cmd).cloned(),
+                _ => {
+                    if let Some(func) = self.sh.completion_funcs.get(cmd).cloned() {
+                        let line: String = self.buf.iter().collect();
+                        let before: String = self.buf[..self.cur].iter().collect();
+                        let trailing_space = before.ends_with(char::is_whitespace);
+                        let mut words: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+                        if words.is_empty() {
+                            words.push(String::new());
+                        }
+                        let cword = if trailing_space {
+                            before.split_whitespace().count()
+                        } else {
+                            before.split_whitespace().count().saturating_sub(1)
+                        };
+                        let cword = cword.min(words.len().saturating_sub(1));
+                        let _ = self.sh.set_str("COMP_LINE", line.clone());
+                        let _ = self.sh.set("COMP_WORDS", crate::shell::Val::Arr(words));
+                        let _ = self.sh.set_str("COMP_POINT", self.cur.to_string());
+                        let _ = self.sh.set_str("COMP_CWORD", cword.to_string());
+                        let _ = self.sh.unset_var("COMPREPLY");
+                        if let Some(f) = self.sh.funcs.get(&func).cloned() {
+                            let _ = self.sh.call_function(&f, &[]);
+                        }
+                        let mut reply = Vec::new();
+                        if let Some(v) = self.sh.var("COMPREPLY") {
+                            match &v.val {
+                                crate::shell::Val::Arr(a) => reply = a.clone(),
+                                crate::shell::Val::Str(s) => reply = s.split_whitespace().map(|x| x.to_string()).collect(),
+                                _ => {}
+                            }
+                        }
+                        if reply.is_empty() {
+                            self.sh.completions.get(cmd).cloned()
+                        } else {
+                            Some(reply)
+                        }
+                    } else {
+                        self.sh.completions.get(cmd).cloned()
+                    }
+                }
             };
             if let Some(names) = special {
                 let c = Self::word_cands(names, &raw);

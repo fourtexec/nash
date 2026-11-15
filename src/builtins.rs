@@ -914,6 +914,7 @@ impl Shell {
             "history" => self.builtin_history(args),
             "complete" => {
                 let mut words: Option<Vec<String>> = None;
+                let mut func: Option<String> = None;
                 let mut remove = false;
                 let mut names = Vec::new();
                 let mut i = 0;
@@ -923,8 +924,12 @@ impl Shell {
                             i += 1;
                             words = args.get(i).map(|w| w.split_whitespace().map(|s| s.to_string()).collect());
                         }
+                        "-F" => {
+                            i += 1;
+                            func = args.get(i).cloned();
+                        }
                         "-r" => remove = true,
-                        "-F" | "-o" | "-A" | "-C" | "-X" | "-P" | "-S" | "-G" => i += 1,
+                        "-o" | "-A" | "-C" | "-X" | "-P" | "-S" | "-G" => i += 1,
                         a if a.starts_with('-') => {}
                         a => names.push(a.to_string()),
                     }
@@ -936,13 +941,22 @@ impl Shell {
                     for (k, w) in v {
                         out!("complete -W {} {}\n", shell_quote(&w.join(" ")), k);
                     }
+                    for (k, f) in &self.completion_funcs {
+                        out!("complete -F {} {}\n", f, k);
+                    }
                     return Ok(0);
                 }
                 for n in names {
                     if remove {
                         self.completions.remove(&n);
-                    } else if let Some(w) = &words {
-                        self.completions.insert(n, w.clone());
+                        self.completion_funcs.remove(&n);
+                    } else {
+                        if let Some(w) = &words {
+                            self.completions.insert(n.clone(), w.clone());
+                        }
+                        if let Some(f) = &func {
+                            self.completion_funcs.insert(n, f.clone());
+                        }
                     }
                 }
                 Ok(0)
