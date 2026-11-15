@@ -6,10 +6,31 @@ use std::io::Write;
 #[derive(Clone)]
 pub struct Entry {
     pub cmd: String,
+    /// `cmd` lowercased, cached so case-insensitive history search never has to
+    /// allocate or re-fold the same entry twice.
+    pub lc: String,
     pub cwd: String,
     pub ts: i64,
     pub status: i32,
     pub dur_ms: u64,
+}
+
+impl Entry {
+    pub fn new(cmd: String, cwd: String, ts: i64, status: i32, dur_ms: u64) -> Entry {
+        let lc = cmd.to_lowercase();
+        Entry { cmd, lc, cwd, ts, status, dur_ms }
+    }
+
+    /// Whether the command contains `needle`. When `ignore_case` is set the
+    /// needle must already be lowercased (smartcase), matching `self.lc`.
+    #[inline]
+    pub fn matches(&self, needle: &str, ignore_case: bool) -> bool {
+        if ignore_case {
+            self.lc.contains(needle)
+        } else {
+            self.cmd.contains(needle)
+        }
+    }
 }
 
 pub struct History {
@@ -59,7 +80,7 @@ impl History {
             lines += 1;
             let mut it = line.splitn(5, '\t');
             if let (Some(ts), Some(dur), Some(st), Some(cwd), Some(cmd)) = (it.next(), it.next(), it.next(), it.next(), it.next()) {
-                self.entries.push(Entry { cmd: unescape(cmd), cwd: cwd.to_string(), ts: ts.parse().unwrap_or(0), status: st.parse().unwrap_or(0), dur_ms: dur.parse().unwrap_or(0) });
+                self.entries.push(Entry::new(unescape(cmd), cwd.to_string(), ts.parse().unwrap_or(0), st.parse().unwrap_or(0), dur.parse().unwrap_or(0)));
             }
         }
         if self.entries.len() > self.max {

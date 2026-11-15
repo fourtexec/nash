@@ -2,6 +2,7 @@
 //! menu completion, multi-line editing and incremental history search.
 
 use crate::highlight::{highlight, sgr, St};
+use crate::history::Entry;
 use crate::parser::RESERVED;
 use crate::prompt::{char_width, visible_width};
 use crate::shell::Shell;
@@ -92,6 +93,58 @@ impl Painter {
     }
 }
 
+/// Incremental history search used by the up/down arrows.
+///
+/// Any history entry containing the current line (as a substring, smartcase)
+/// is a match, like fish. Matches are found lazily and cached one at a time as
+/// the user keeps pressing Up, so a search only scans the entries it actually
+/// needs instead of rescanning the whole history on every keypress.
+#[derive(Default)]
+struct HistNav {
+    /// Needle used for matching (lowercased when `ignore_case`).
+    needle: String,
+    ignore_case: bool,
+    /// Indices of the entries found so far, newest first.
+    matches: Vec<usize>,
+    /// Current position in `matches`.
+    pos: usize,
+    /// Exclusive upper bound for the next backward scan.
+    scan: usize,
+    /// Texts already shown; older duplicates are skipped, as in fish.
+    seen: std::collections::HashSet<String>,
+    /// Whether `needle`/`matches`/`scan` describe the current line.
+    valid: bool,
+}
+
+impl HistNav {
+    /// Start a fresh search for `term` across a history of `len` entries.
+    fn begin(&mut self, term: &str, len: usize) {
+        let lower = term.to_lowercase();
+        self.ignore_case = term == lower;
+        self.needle = if self.ignore_case { lower } else { term.to_string() };
+        self.matches.clear();
+        self.pos = 0;
+        self.scan = len;
+        self.seen.clear();
+        self.seen.insert(term.to_string());
+        self.valid = true;
+    }
+
+    /// Find the next older match, resuming the backward scan where it stopped.
+    fn older(&mut self, entries: &[Entry]) -> Option<usize> {
+        while self.scan > 0 {
+            self.scan -= 1;
+            let e = &entries[self.scan];
+            if !e.matches(&self.needle, self.ignore_case) || !self.seen.insert(e.cmd.clone()) {
+                continue;
+            }
+            self.matches.push(self.scan);
+            return Some(self.scan);
+        }
+        None
+    }
+}
+
 struct Editor<'a> {
     sh: &'a mut Shell,
     prompt: String,
@@ -103,6 +156,7 @@ struct Editor<'a> {
     suggestion: String,
     hist_idx: Option<usize>,
     hist_prefix: String,
+    hnav: HistNav,
     saved: Vec<char>,
     menu: Option<Menu>,
     kill: Vec<char>,
@@ -380,6 +434,7 @@ impl<'a> Editor<'a> {
 
     fn edited(&mut self) {
         self.hist_idx = None;
+        self.hnav.valid = false;
         self.suggestion.clear();
         if !self.buf.is_empty() && self.cur == self.buf.len() {
             let t = self.text();
@@ -465,42 +520,53 @@ impl<'a> Editor<'a> {
     }
 
     fn hist_move(&mut self, up: bool) {
-        let n = self.sh.history.entries.len();
         if self.hist_idx.is_none() {
             if !up {
                 return;
             }
-            self.saved = self.buf.clone();
-            self.hist_prefix = self.text();
+            let text = self.text();
+            // Reuse the matches from a search for this exact line (e.g. after
+            // paging back down to it) instead of scanning the history again.
+            if !(self.hnav.valid && self.hist_prefix == text) {
+                self.saved = self.buf.clone();
+                self.hist_prefix = text.clone();
+                let n = self.sh.history.entries.len();
+                self.hnav.begin(&text, n);
+            }
+            if self.hnav.matches.is_empty() && self.hnav.older(&self.sh.history.entries).is_none() {
+                return;
+            }
+            self.hnav.pos = 0;
+            let i = self.hnav.matches[0];
+            let c = self.sh.history.entries[i].cmd.clone();
+            self.set_buf(&c);
+            self.hist_idx = Some(i);
+            return;
         }
-        let cur_text = self.text();
-        let found = if up {
-            let from = self.hist_idx.unwrap_or(n);
-            (0..from).rev().find(|&i| {
-                let c = &self.sh.history.entries[i].cmd;
-                c.starts_with(&self.hist_prefix) && *c != cur_text
-            })
+
+        if up {
+            if self.hnav.pos + 1 < self.hnav.matches.len() {
+                self.hnav.pos += 1;
+            } else if self.hnav.older(&self.sh.history.entries).is_some() {
+                self.hnav.pos = self.hnav.matches.len() - 1;
+            } else {
+                return;
+            }
+            let i = self.hnav.matches[self.hnav.pos];
+            let c = self.sh.history.entries[i].cmd.clone();
+            self.set_buf(&c);
+            self.hist_idx = Some(i);
+        } else if self.hnav.pos > 0 {
+            self.hnav.pos -= 1;
+            let i = self.hnav.matches[self.hnav.pos];
+            let c = self.sh.history.entries[i].cmd.clone();
+            self.set_buf(&c);
+            self.hist_idx = Some(i);
         } else {
-            let from = self.hist_idx.unwrap_or(n) + 1;
-            (from..n).find(|&i| {
-                let c = &self.sh.history.entries[i].cmd;
-                c.starts_with(&self.hist_prefix) && *c != cur_text
-            })
-        };
-        match found {
-            Some(i) => {
-                let c = self.sh.history.entries[i].cmd.clone();
-                self.set_buf(&c);
-                self.hist_idx = Some(i);
-            }
-            None => {
-                if !up {
-                    self.buf = self.saved.clone();
-                    self.cur = self.buf.len();
-                    self.hist_idx = None;
-                    self.suggestion.clear();
-                }
-            }
+            self.buf = self.saved.clone();
+            self.cur = self.buf.len();
+            self.hist_idx = None;
+            self.suggestion.clear();
         }
     }
 
@@ -1211,6 +1277,7 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
         suggestion: String::new(),
         hist_idx: None,
         hist_prefix: String::new(),
+        hnav: HistNav::default(),
         saved: Vec::new(),
         menu: None,
         kill: Vec::new(),
@@ -1224,3 +1291,44 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
     let _ = sys::tcsetattr(0, sys::TCSADRAIN, &orig);
     r
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(cmds: &[&str]) -> Vec<Entry> {
+        cmds.iter().map(|c| Entry::new((*c).to_string(), String::new(), 0, 0, 0)).collect()
+    }
+
+    #[test]
+    fn history_search_substring_smartcase_and_dedup() {
+        let e = entries(&["echo 1", "ls /tmp", "echo 2", "echo 1"]);
+
+        // Any substring matches, newest first; duplicates are skipped.
+        let mut h = HistNav::default();
+        h.begin("cho", e.len());
+        assert_eq!(h.older(&e), Some(3));
+        assert_eq!(h.older(&e), Some(2));
+        assert_eq!(h.older(&e), None);
+
+        // A needle with an uppercase character is case sensitive.
+        let mut h = HistNav::default();
+        h.begin("ECHO", e.len());
+        assert_eq!(h.older(&e), None);
+
+        // A lowercase needle matches regardless of case.
+        let e2 = entries(&["Echo X"]);
+        let mut h = HistNav::default();
+        h.begin("echo", e2.len());
+        assert_eq!(h.older(&e2), Some(0));
+
+        // An empty needle browses everything but still deduplicates.
+        let mut h = HistNav::default();
+        h.begin("", e.len());
+        assert_eq!(h.older(&e), Some(3));
+        assert_eq!(h.older(&e), Some(2));
+        assert_eq!(h.older(&e), Some(1));
+        assert_eq!(h.older(&e), None);
+    }
+}
+

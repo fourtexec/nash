@@ -230,7 +230,7 @@ fn interactive_loop(sh: &mut Shell) -> R {
         sh.loop_depth = 0;
         sh.last_duration_ms = dur;
         if !line.starts_with(' ') {
-            sh.history.add(history::Entry { cmd: line.trim_end().to_string(), cwd, ts, status: exit.unwrap_or(sh.last_status), dur_ms: dur });
+            sh.history.add(history::Entry::new(line.trim_end().to_string(), cwd, ts, exit.unwrap_or(sh.last_status), dur));
         }
         if let Some(s) = exit {
             return Err(Flow::Exit(s));
