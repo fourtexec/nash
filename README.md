@@ -68,6 +68,7 @@ command substitution, arithmetic, field splitting, globbing, `trap`, `getopts`,
 | "Did you mean" for mistyped commands | `gti` → `git` |
 | History with context | `history --here`, `history --failed`, `history --long` |
 | Batteries-included editor | syntax highlighting, autosuggestions, git-aware prompt |
+| File-type colours out of the box | `ls`, `la`, `ll`, `grep`, `diff` and the completion menu |
 
 **Named parameters.** Arguments are bound to local variables and checked:
 
@@ -94,6 +95,15 @@ try {
 
 **defer.** Deferred commands run in reverse order when the function exits —
 however it exits. At top level they run when the shell exits.
+
+**File-type colours.** Interactive shells get a default `LS_COLORS` that
+distinguishes directories, symlinks, executables, archives, images, video,
+audio, documents, source code, scripts, config files and temporary files.
+`ls`, `la`, `ll`, `lla`, `l`, `dir`, `grep`, `diff` and `tree` are aliased to
+their colour-enabled forms, and the Tab completion menu uses the same colours.
+All of this happens before `~/.nashrc` is read, so you can override it there
+(`export LS_COLORS=…`, `unalias ls`); your own `LS_COLORS` is always respected,
+and setting `NO_COLOR` turns the feature off.
 
 **History with context.** Every entry records the directory, time, duration
 and exit status. Autosuggestions prefer commands you ran in the *current*
