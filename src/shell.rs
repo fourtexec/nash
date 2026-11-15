@@ -248,6 +248,23 @@ impl Shell {
         let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
         let _ = sh.set_str("PWD", cwd);
         sh.export_var("PWD");
+
+        // HOME and USER from env if present, otherwise resolve lazily via getpwuid.
+        if let Ok(h) = std::env::var("HOME") {
+            if crate::parser::is_name("HOME") {
+                let _ = sh.set_str("HOME", h.clone());
+                sh.export_var("HOME");
+                sh.home_dir = Some(h);
+            }
+        }
+        if let Ok(u) = std::env::var("USER") {
+            if crate::parser::is_name("USER") {
+                let _ = sh.set_str("USER", u.clone());
+                sh.export_var("USER");
+                sh.user_name = Some(u);
+            }
+        }
+
         let lvl = sh.get("SHLVL").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) + 1;
         let _ = sh.set_str("SHLVL", lvl.to_string());
         sh.export_var("SHLVL");
