@@ -43,6 +43,8 @@ struct Cand {
     text: String,
     display: String,
     dir: bool,
+    /// SGR parameters (from LS_COLORS) used in the completion menu.
+    color: String,
 }
 
 struct Menu {
@@ -106,6 +108,7 @@ struct Editor<'a> {
     kill: Vec<char>,
     search: Option<(String, Option<usize>)>,
     cwd: String,
+    ls: crate::colors::LsColors,
 }
 
 const GIT_CMDS: &[&str] = &[
@@ -298,8 +301,8 @@ impl<'a> Editor<'a> {
                 let padding = " ".repeat(colw - w);
                 if Some(idx) == m.sel {
                     line.push_str(&format!("\x1b[7m{}\x1b[0m{}", d, padding));
-                } else if it.dir {
-                    line.push_str(&format!("\x1b[1;34m{}\x1b[0m{}", d, padding));
+                } else if !it.color.is_empty() {
+                    line.push_str(&format!("\x1b[{}m{}\x1b[0m{}", it.color, d, padding));
                 } else {
                     line.push_str(&format!("{}{}", d, padding));
                 }
@@ -602,7 +605,8 @@ impl<'a> Editor<'a> {
                     text.push('/');
                     display.push('/');
                 }
-                Cand { text, display, dir: *is_dir }
+                let color = self.ls.color_for(&format!("{}/{}", dir_real.trim_end_matches('/'), name), name);
+                Cand { text, display, dir: *is_dir, color }
             })
             .collect()
     }
@@ -611,7 +615,7 @@ impl<'a> Editor<'a> {
         let mut v: Vec<String> = names.into_iter().filter(|n| n.starts_with(prefix)).collect();
         v.sort();
         v.dedup();
-        v.into_iter().map(|n| Cand { text: escape_word(&n), display: n, dir: false }).collect()
+        v.into_iter().map(|n| Cand { text: escape_word(&n), display: n, dir: false, color: String::new() }).collect()
     }
 
     fn git_refs(&mut self) -> Vec<String> {
@@ -659,7 +663,7 @@ impl<'a> Editor<'a> {
             let mut names: Vec<String> = self.sh.all_vars().into_iter().map(|(n, _)| n).filter(|n| n.starts_with(name)).collect();
             names.sort();
             let q = quote.map(|q| q.to_string()).unwrap_or_default();
-            return names.into_iter().map(|n| Cand { text: format!("{}{}{}{}", q, pre, n, post), display: n, dir: false }).collect();
+            return names.into_iter().map(|n| Cand { text: format!("{}{}{}{}", q, pre, n, post), display: n, dir: false, color: "36".to_string() }).collect();
         }
         let seg_start = before.rfind(['|', ';', '&', '(', '\n', '`']).map(|i| i + 1).unwrap_or(0);
         let mut tokens: Vec<&str> = before[seg_start..].split_whitespace().collect();
@@ -1128,6 +1132,7 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
     let intro = format!("\x1b[?2004h\x1b[7m%\x1b[0m{}\r\x1b[K{}", " ".repeat(cols.saturating_sub(1)), head);
     sys::write_fd(2, intro.as_bytes());
     let cwd = sh.cwd();
+    let ls = crate::colors::LsColors::parse(&sh.get("LS_COLORS").unwrap_or_default());
     let mut ed = Editor {
         sh,
         prompt: last.to_string(),
@@ -1144,6 +1149,7 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
         kill: Vec::new(),
         search: None,
         cwd,
+        ls,
     };
     ed.refresh();
     let r = ed.run();

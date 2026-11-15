@@ -5,6 +5,7 @@ mod sys;
 mod arith;
 mod ast;
 mod builtins;
+mod colors;
 mod cond;
 mod editor;
 mod exec;
@@ -250,6 +251,7 @@ fn setup_interactive(sh: &mut Shell, norc: bool, login: bool) {
         None => format!("{}/history", sh.data_dir()),
     };
     sh.history.load(&hist);
+    colors::setup(sh);
     let home = sh.home();
     if login {
         for f in ["/etc/profile".to_string(), format!("{}/.profile", home)] {
