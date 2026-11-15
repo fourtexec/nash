@@ -354,6 +354,12 @@ impl arith::Env for Shell {
             Some(i) => self.set_elem(name, i, val, false).map_err(|_| format!("{}: bad array subscript", name)),
         }
     }
+    fn strict_arith(&self) -> bool {
+        self.opts.strict_arith
+    }
+    fn nounset(&self) -> bool {
+        self.opts.nounset
+    }
 }
 
 impl Shell {
@@ -368,7 +374,7 @@ impl Shell {
             Ok(n) => Ok(n),
             Err(e) => {
                 sherr!("{}", e);
-                Err(Flow::Abort(2))
+                Err(Flow::Abort(1))
             }
         }
     }

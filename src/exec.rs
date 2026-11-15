@@ -67,7 +67,7 @@ impl Shell {
                         // an expansion error aborts only the current command
                         Err(Flow::Abort(s)) if self.try_depth == 0 => {
                             self.last_status = s;
-                            s
+                            return Ok(s);
                         }
                         other => other?,
                     }
@@ -206,7 +206,14 @@ impl Shell {
                         st = self.run_bg(&it.cmd, &text)?;
                         self.last_status = st;
                     } else {
-                        st = self.run(&it.cmd)?;
+                        match self.run(&it.cmd) {
+                            Ok(s) => st = s,
+                            Err(Flow::Abort(s)) => {
+                                self.last_status = s;
+                                return Err(Flow::Abort(s));
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
                 Ok(st)

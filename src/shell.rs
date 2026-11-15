@@ -46,6 +46,7 @@ pub struct Opts {
     pub noglob: bool,
     pub noclobber: bool,
     pub pipefail: bool,
+    pub strict_arith: bool,
     pub autocd: bool,
     pub dotglob: bool,
     pub nullglob: bool,
@@ -53,7 +54,7 @@ pub struct Opts {
     pub verbose: bool,
 }
 
-pub const OPTION_NAMES: &[&str] = &["allexport", "autocd", "dotglob", "errexit", "noclobber", "noglob", "nounset", "nullglob", "pipefail", "verbose", "xtrace"];
+pub const OPTION_NAMES: &[&str] = &["allexport", "autocd", "dotglob", "errexit", "noclobber", "noglob", "nounset", "nullglob", "pipefail", "strict_arith", "verbose", "xtrace"];
 
 impl Opts {
     pub fn get(&self, name: &str) -> Option<bool> {
@@ -69,6 +70,7 @@ impl Opts {
             "nullglob" => self.nullglob,
             "allexport" => self.allexport,
             "verbose" => self.verbose,
+            "strict_arith" => self.strict_arith,
             _ => return None,
         })
     }
@@ -85,6 +87,7 @@ impl Opts {
             "nullglob" | "null_glob" => self.nullglob = on,
             "allexport" => self.allexport = on,
             "verbose" => self.verbose = on,
+            "strict_arith" => self.strict_arith = on,
             "strict" => {
                 self.errexit = on;
                 self.nounset = on;

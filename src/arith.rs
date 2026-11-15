@@ -51,6 +51,8 @@ impl Num {
 pub trait Env {
     fn get(&mut self, name: &str, idx: Option<&str>) -> Option<String>;
     fn set(&mut self, name: &str, idx: Option<&str>, val: String) -> Result<(), String>;
+    fn strict_arith(&self) -> bool { false }
+    fn nounset(&self) -> bool { false }
 }
 
 type Lv = Option<(String, Option<String>)>;
@@ -61,17 +63,21 @@ struct Ev<'a> {
     env: &'a mut dyn Env,
     noeval: u32,
     depth: u32,
+    strict_arith: bool,
+    nounset: bool,
 }
 
 pub fn eval(expr: &str, env: &mut dyn Env) -> Result<Num, String> {
     eval_depth(expr, env, 0)
 }
 
-fn eval_depth(expr: &str, env: &mut dyn Env, depth: u32) -> Result<Num, String> {
+fn eval_depth_with_strict(expr: &str, env: &mut dyn Env, depth: u32) -> Result<Num, String> {
     if depth > 64 {
         return Err("expression recursion level exceeded".into());
     }
-    let mut ev = Ev { s: expr.chars().collect(), pos: 0, env, noeval: 0, depth };
+    let strict = env.strict_arith();
+    let nounset = env.nounset();
+    let mut ev = Ev { s: expr.chars().collect(), pos: 0, env, noeval: 0, depth, strict_arith: strict, nounset };
     ev.ws();
     if ev.pos >= ev.s.len() {
         return Ok(Num::I(0));
@@ -85,7 +91,11 @@ fn eval_depth(expr: &str, env: &mut dyn Env, depth: u32) -> Result<Num, String> 
     Ok(v)
 }
 
-fn parse_number(t: &str) -> Option<Num> {
+fn eval_depth(expr: &str, env: &mut dyn Env, depth: u32) -> Result<Num, String> {
+    eval_depth_with_strict(expr, env, depth)
+}
+
+fn parse_number(t: &str, strict_arith: bool) -> Option<Num> {
     let t = t.trim();
     if t.is_empty() {
         return None;
@@ -97,11 +107,38 @@ fn parse_number(t: &str) -> Option<Num> {
     let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         Num::I(i64::from_str_radix(h, 16).ok()?)
     } else if let Some(i) = body.find('#') {
-        let base: u32 = body[..i].parse().ok()?;
-        if !(2..=36).contains(&base) {
+        let base_str = &body[..i];
+        // Base must not have leading zeros (except "0" itself which is invalid anyway)
+        if base_str.len() > 1 && base_str.starts_with('0') {
             return None;
         }
-        Num::I(i64::from_str_radix(&body[i + 1..], base).ok()?)
+        let base: u32 = base_str.parse().ok()?;
+        if !(2..=64).contains(&base) {
+            return None;
+        }
+        let digits = &body[i + 1..];
+        let mut val: i64 = 0;
+        for c in digits.chars() {
+            let d = match c {
+                '0'..='9' => c as u32 - '0' as u32,
+                'A'..='Z' => {
+                    if base <= 36 {
+                        10 + (c as u32 - 'A' as u32)
+                    } else {
+                        36 + (c as u32 - 'A' as u32)
+                    }
+                }
+                'a'..='z' => 10 + (c as u32 - 'a' as u32),
+                '@' => 62,
+                '_' => 63,
+                _ => return None,
+            };
+            if d >= base {
+                return None;
+            }
+            val = val * base as i64 + d as i64;
+        }
+        Num::I(val)
     } else if body.len() > 1 && body.starts_with('0') && body.chars().all(|c| c.is_ascii_digit()) {
         Num::I(i64::from_str_radix(body, 8).ok()?)
     } else if body.chars().all(|c| c.is_ascii_digit()) {
@@ -110,7 +147,14 @@ fn parse_number(t: &str) -> Option<Num> {
             Err(_) => Num::I(body.parse::<u64>().ok()? as i64),
         }
     } else if body.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
-        Num::F(body.parse::<f64>().ok()?)
+        if body.contains('.') {
+            if strict_arith {
+                return None;
+            }
+            Num::F(body.parse::<f64>().ok()?)
+        } else {
+            Num::I(body.parse::<i64>().ok()?)
+        }
     } else {
         return None;
     };
@@ -427,7 +471,7 @@ impl<'a> Ev<'a> {
                 }
             }
             let t: String = self.s[start..self.pos].iter().collect();
-            return match parse_number(&t) {
+            return match parse_number(&t, self.strict_arith) {
                 Some(n) => Ok((n, None)),
                 None => Err(format!("{}: invalid number", t)),
             };
@@ -493,11 +537,21 @@ impl<'a> Ev<'a> {
                 Num::I(0)
             } else {
                 match self.env.get(&name, idx.as_deref()) {
-                    None => Num::I(0),
-                    Some(s) => match parse_number(&s) {
+                    None => {
+                        if self.nounset {
+                            return Err(format!("{}: unbound variable", name));
+                        }
+                        Num::I(0)
+                    }
+                    Some(s) => match parse_number(&s, self.strict_arith) {
                         Some(n) => n,
                         None if s.trim().is_empty() => Num::I(0),
-                        None => eval_depth(&s, self.env, self.depth + 1)?,
+                        None => {
+                            if self.strict_arith {
+                                return Err(format!("{}: invalid number", s));
+                            }
+                            eval_depth(&s, self.env, self.depth + 1)?
+                        }
                     },
                 }
             };

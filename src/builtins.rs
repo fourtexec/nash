@@ -622,8 +622,8 @@ impl Shell {
                 let mut st = 0;
                 for a in args {
                     match a.as_str() {
-                        "-s" => on = Some(true),
-                        "-u" => on = Some(false),
+                        "-s" | "--set" => on = Some(true),
+                        "-u" | "--unset" => on = Some(false),
                         "-q" => quiet = true,
                         "-o" | "-p" => {}
                         n => match on {
