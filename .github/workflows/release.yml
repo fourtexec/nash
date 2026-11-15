@@ -51,9 +51,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-linux-android
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
