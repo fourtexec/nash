@@ -24,6 +24,18 @@ cargo build --release
 
 Run the tests with `cargo test`.
 
+## Install as your main shell
+
+```bash
+./target/release/nash install
+```
+
+This copies the binary to `/usr/local/bin` (or `~/.local/bin` if that is not
+writable), adds it to `/etc/shells` and makes it your login shell with `chsh`.
+It prints the command that undoes the change. Options: `--prefix DIR` installs
+into `DIR/bin`, `--no-chsh` installs the binary only. Because `install` is a
+subcommand, run a script that happens to be called `install` as `nash ./install`.
+
 ## What you get
 
 ### From sh — the whole language
@@ -68,6 +80,7 @@ command substitution, arithmetic, field splitting, globbing, `trap`, `getopts`,
 | "Did you mean" for mistyped commands | `gti` → `git` |
 | History with context | `history --here`, `history --failed`, `history --long` |
 | Batteries-included editor | syntax highlighting, autosuggestions, git-aware prompt |
+| Picks up where you left off | a new session starts in the directory the previous one was in |
 | File-type colours out of the box | `ls`, `la`, `ll`, `grep`, `diff` and the completion menu |
 
 **Named parameters.** Arguments are bound to local variables and checked:
@@ -104,6 +117,11 @@ their colour-enabled forms, and the Tab completion menu uses the same colours.
 All of this happens before `~/.nashrc` is read, so you can override it there
 (`export LS_COLORS=…`, `unalias ls`); your own `LS_COLORS` is always respected,
 and setting `NO_COLOR` turns the feature off.
+
+**Session directory.** nash remembers the directory you were last in and
+starts the next interactive session there. This only happens when the shell
+starts in your home directory, so a terminal deliberately opened in a project
+folder stays there. Put `NASH_RESTORE_DIR=0` in `~/.nashrc` to turn it off.
 
 **History with context.** Every entry records the directory, time, duration
 and exit status. Autosuggestions prefer commands you ran in the *current*
@@ -145,6 +163,7 @@ git subcommands and branches, cargo subcommands, and anything registered with
 | `~/.profile` | read by login shells (`nash -l`) |
 | `~/.local/share/nash/history` | history (`$NASH_HISTFILE` overrides) |
 | `~/.local/share/nash/z` | directory database for `z` |
+| `~/.local/share/nash/last_dir` | directory of the previous session |
 
 ## Differences from bash worth knowing
 

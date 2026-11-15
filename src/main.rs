@@ -12,6 +12,7 @@ mod exec;
 mod expand;
 mod glob;
 mod highlight;
+mod install;
 mod history;
 mod parser;
 mod prompt;
@@ -34,6 +35,8 @@ options:
   --norc        do not read ~/.nashrc
   --version     print version and exit
   --help        print this help
+
+nash install    install nash and make it your login shell (see `nash install --help')
 ";
 
 /// Run exit handlers and terminate.
@@ -57,6 +60,9 @@ fn finish(sh: &mut Shell, r: R) -> ! {
         if let Err(Flow::Exit(s)) = sh.run_trap(&t) {
             status = s;
         }
+    }
+    if sh.interactive && !sh.is_child {
+        sh.save_last_dir();
     }
     if sh.interactive {
         for j in &sh.jobs {
@@ -218,7 +224,7 @@ fn interactive_loop(sh: &mut Shell) -> R {
     }
 }
 
-fn setup_interactive(sh: &mut Shell, norc: bool, login: bool) {
+fn setup_interactive(sh: &mut Shell, norc: bool, login: bool, restore_dir: bool) {
     sh.interactive = true;
     sh.opts.autocd = true;
     let tty = sys::open("/dev/tty", libc::O_RDWR | libc::O_CLOEXEC, 0);
@@ -268,12 +274,27 @@ fn setup_interactive(sh: &mut Shell, norc: bool, login: bool) {
             }
         }
     }
+    // Start where the previous session left off, unless the terminal was
+    // deliberately opened somewhere other than the home directory.
+    if restore_dir && sh.get("NASH_RESTORE_DIR").as_deref() != Some("0") && sh.cwd() == home {
+        let file = format!("{}/last_dir", sh.data_dir());
+        if let Ok(d) = std::fs::read_to_string(file) {
+            let d = d.trim_end_matches('\n').to_string();
+            if d != home && sys::is_dir(&d) {
+                let _ = sh.run_builtin("cd", &["cd".to_string(), d]);
+                sh.last_status = 0;
+            }
+        }
+    }
 }
 
 fn main() {
     // Rust ignores SIGPIPE by default; a shell must not.
     sys::default_signal(libc::SIGPIPE);
     let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+    if args.get(1).map(|a| a == "install").unwrap_or(false) {
+        std::process::exit(install::install(&args[2..]));
+    }
     let mut sh = Shell::new();
     let mut command: Option<String> = None;
     let mut force_interactive = false;
@@ -358,7 +379,7 @@ fn main() {
         }
         sh.pos_params = rest.iter().skip(1).cloned().collect();
         if force_interactive {
-            setup_interactive(&mut sh, norc, login);
+            setup_interactive(&mut sh, norc, login, false);
         }
         let r = sh.run_source(&cmd, "nash");
         finish(&mut sh, r);
@@ -379,7 +400,7 @@ fn main() {
     }
     sh.pos_params = rest.to_vec();
     if force_interactive || (sys::isatty(0) && sys::isatty(2)) {
-        setup_interactive(&mut sh, norc, login);
+        setup_interactive(&mut sh, norc, login, true);
         let r = interactive_loop(&mut sh);
         finish(&mut sh, r);
     }

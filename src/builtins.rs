@@ -1096,6 +1096,7 @@ impl Shell {
                 }
                 if self.interactive {
                     self.z_add(&newpwd);
+                    self.save_last_dir();
                 }
                 if let Some(f) = self.funcs.get("chpwd").cloned() {
                     let st = self.last_status;
@@ -1945,6 +1946,12 @@ impl Shell {
         if std::fs::write(&tmp, body).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+    }
+
+    /// Remember the current directory so the next session can start there.
+    pub fn save_last_dir(&mut self) {
+        let cwd = self.cwd();
+        let _ = std::fs::write(format!("{}/last_dir", self.data_dir()), format!("{}\n", cwd));
     }
 
     pub fn z_add(&mut self, dir: &str) {
