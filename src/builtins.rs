@@ -7,7 +7,7 @@ use crate::sys;
 use std::rc::Rc;
 
 pub const BUILTINS: &[&str] = &[
-    ".", ":", "[", "abbr", "alias", "bg", "break", "builtin", "cd", "command", "complete", "contains", "continue", "count", "declare", "defer", "dirs", "disown", "echo", "eval", "exec", "exit", "export", "false", "fg", "functions", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "mapfile", "math", "path", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "realpath", "return", "set", "set_color", "setopt", "shift", "shopt", "source", "status", "string", "test", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait", "which", "z", "zi",
+    ".", ":", "[", "abbr", "alias", "bg", "break", "builtin", "cd", "command", "complete", "contains", "continue", "count", "declare", "defer", "dirs", "disown", "echo", "eval", "exec", "exit", "export", "false", "fg", "fish_add_path", "fish_is_root_user", "fish_status_to_signal", "functions", "getopts", "hash", "help", "history", "jobs", "kill", "let", "local", "mapfile", "math", "path", "popd", "printf", "prompt_pwd", "pushd", "pwd", "read", "readarray", "readonly", "realpath", "return", "set", "set_color", "setopt", "shift", "shopt", "source", "status", "string", "test", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait", "which", "z", "zi",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -1241,6 +1241,79 @@ impl Shell {
             }
             "string" => self.builtin_string(args),
             "ulimit" => self.builtin_ulimit(args),
+            "fish_add_path" => {
+                // fish_add_path [options] PATH...
+                let mut append = false;
+                let mut prepend = true;
+                let mut i = 0;
+                while i < args.len() && args[i].starts_with('-') {
+                    match args[i].as_str() {
+                        "-a" | "--append" => { append = true; prepend = false; }
+                        "-p" | "--prepend" => { prepend = true; append = false; }
+                        "-g" | "--global" => {}
+                        "-U" | "--universal" => {}
+                        "-P" | "--path" => {}
+                        "--" => { i += 1; break; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let paths = &args[i..];
+                let path = self.get("PATH").unwrap_or_default();
+                let mut parts: Vec<String> = path.split(':').map(|s| s.to_string()).collect();
+                for p in paths {
+                    if append {
+                        if !parts.contains(p) { parts.push(p.clone()); }
+                    } else {
+                        if !parts.contains(p) { parts.insert(0, p.clone()); }
+                    }
+                }
+                let _ = prepend;
+                let newpath = parts.join(":");
+                let _ = self.set_str("PATH", newpath);
+                self.export_var("PATH");
+                self.hash.clear();
+                self.path_cmds = None;
+                Ok(0)
+            }
+            "fish_is_root_user" => {
+                Ok(if unsafe { libc::geteuid() } == 0 { 0 } else { 1 })
+            }
+            "fish_status_to_signal" => {
+                let n = args.first().and_then(|a| a.parse::<i32>().ok()).unwrap_or(self.last_status);
+                out!("{}\n", sys::sig_name(n));
+                Ok(0)
+            }
+            "prompt_pwd" => {
+                let cwd = if let Some(d) = args.first() { d.clone() } else { self.cwd() };
+                let home = self.home();
+                let mut s = if cwd == home {
+                    "~".to_string()
+                } else if let Some(rest) = cwd.strip_prefix(&format!("{}/", home)) {
+                    format!("~/{}", rest)
+                } else {
+                    cwd.clone()
+                };
+                // abbreviate intermediate components like fish
+                let parts: Vec<&str> = s.split('/').collect();
+                if parts.len() > 3 {
+                    let mut outp = String::new();
+                    for (i, p) in parts.iter().enumerate() {
+                        if i == parts.len() - 1 || p.is_empty() || *p == "~" {
+                            outp.push_str(p);
+                        } else {
+                            let ch = p.chars().next().unwrap_or('?');
+                            outp.push(ch);
+                        }
+                        if i + 1 < parts.len() {
+                            outp.push('/');
+                        }
+                    }
+                    s = outp;
+                }
+                out!("{}\n", s);
+                Ok(0)
+            }
             "help" => {
                 out!("{}\n", HELP);
                 let mut line = String::from(" ");

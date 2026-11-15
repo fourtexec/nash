@@ -38,7 +38,8 @@ options:
   --help        print this help
 
 nash install    install nash and make it your login shell (see `nash install --help')
-nash update PATH  replace nash with a newer binary you downloaded (see `nash update --help')
+nash uninstall  remove nash installed by the install script
+nash update     update nash to the newest release from GitHub (see `nash update --help')
 ";
 
 /// Run exit handlers and terminate.
@@ -296,6 +297,9 @@ fn main() {
     let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
     if args.get(1).map(|a| a == "install").unwrap_or(false) {
         std::process::exit(install::install(&args[2..]));
+    }
+    if args.get(1).map(|a| a == "uninstall").unwrap_or(false) {
+        std::process::exit(install::uninstall(&args[2..]));
     }
     if args.get(1).map(|a| a == "update").unwrap_or(false) {
         std::process::exit(update::update(&args[2..]));

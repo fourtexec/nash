@@ -156,3 +156,61 @@ pub fn install(args: &[String]) -> i32 {
     out!("nash is now the login shell for {} (was {})\nopen a new terminal or log in again to use it\nto go back: chsh -s {}\n", user, if current.is_empty() { "unknown" } else { &current }, if current.is_empty() { "/bin/sh" } else { &current });
     0
 }
+
+pub fn uninstall(_args: &[String]) -> i32 {
+    let home = std::env::var("HOME").ok().unwrap_or_else(|| "/".to_string());
+    // Remove the PATH block added by the install script from common rc files.
+    for rc in [format!("{}/.profile", home), format!("{}/.bashrc", home), format!("{}/.zshrc", home), format!("{}/.nashrc", home)] {
+        if let Ok(s) = std::fs::read_to_string(&rc) {
+            let mut out = String::new();
+            let mut skip = false;
+            for line in s.lines() {
+                if line.trim() == "# >>> nash >>>" {
+                    skip = true;
+                    continue;
+                }
+                if line.trim() == "# <<< nash <<<" {
+                    skip = false;
+                    continue;
+                }
+                if skip {
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            let _ = std::fs::write(&rc, out);
+        }
+    }
+
+    // Remove nash from /etc/shells if writable.
+    if let Ok(s) = std::fs::read_to_string("/etc/shells") {
+        let filtered: String = s.lines().filter(|l| !l.trim().ends_with("/nash")).collect::<Vec<_>>().join("\n");
+        let filtered = if s.ends_with('\n') { format!("{}\n", filtered) } else { filtered };
+        let _ = std::fs::write("/etc/shells", filtered);
+    }
+
+    // Try to remove the installed binary (best effort).
+    let candidates = [
+        format!("{}/.local/bin/nash", home),
+        "/usr/local/bin/nash".to_string(),
+    ];
+    for c in &candidates {
+        let _ = std::fs::remove_file(c);
+    }
+
+    // If nash is the login shell, tell the user how to switch back.
+    let current = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
+        }
+    };
+    if current.ends_with("/nash") {
+        out!("nash was your login shell. Switch back with:\n    chsh -s /bin/sh\n(or another shell of your choice)\n");
+    }
+    out!("nash uninstalled. Open a new terminal to apply PATH changes.\n");
+    0
+}
