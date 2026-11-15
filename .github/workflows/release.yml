@@ -115,9 +115,15 @@ jobs:
           merge-multiple: true
       - name: Write SHA256SUMS
         working-directory: dist
+        env:
+          TAG: ${{ needs.name.outputs.tag }}
         run: |
           sha256sum nash-* > SHA256SUMS
           cat SHA256SUMS
+          # The first builds of nash update themselves by reading the file
+          # VERSION of the latest release: give stable releases one, so
+          # that they can move on to a build with the current updater.
+          case "$TAG" in v*) echo "${TAG#v}" > VERSION ;; esac
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}

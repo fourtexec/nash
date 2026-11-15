@@ -38,15 +38,18 @@ case "$arch" in
 esac
 
 asset="nash-${os}-${arch}"
-# Stable: pinned to the latest stable release tag.
-STABLE_TAG="v0.1.0"
-url="https://github.com/${REPO}/releases/download/${STABLE_TAG}/${asset}"
+# Stable: the latest release (development builds are pre-releases and never
+# the latest). If that one has no binary for this platform, the last stable
+# release known to have one.
+FALLBACK_TAG="v0.1.0.7"
+latest="https://github.com/${REPO}/releases/latest/download/${asset}"
+fallback="https://github.com/${REPO}/releases/download/${FALLBACK_TAG}/${asset}"
 tmp="$BIN_DIR/.nash.$$"
 echo "install: downloading $asset"
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp"
+    curl -fsSL "$latest" -o "$tmp" 2>/dev/null || curl -fsSL "$fallback" -o "$tmp"
 elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$url"
+    wget -qO "$tmp" "$latest" || wget -qO "$tmp" "$fallback"
 else
     echo "install: needs curl or wget" >&2
     exit 1
