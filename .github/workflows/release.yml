@@ -5,7 +5,6 @@ name: release
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -85,20 +84,27 @@ jobs:
 
   release:
     needs: [build, build-android-termux]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Compute release tag
+        id: tag
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "tag=v${version}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
       - name: Write VERSION and SHA256SUMS
         working-directory: dist
         run: |
           sha256sum nash-* > SHA256SUMS
-          echo "${GITHUB_REF_NAME#v}" > VERSION
+          echo "${{ steps.tag.outputs.tag }}" > VERSION
           cat SHA256SUMS
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "nash ${GITHUB_REF_NAME#v}" --generate-notes
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --title "nash $tag" --generate-notes || gh release upload "$tag" dist/* --clobber
