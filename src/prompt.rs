@@ -1,9 +1,11 @@
 //! Prompt rendering.
 
 use std::fmt::Write as _;
+use std::os::unix::fs::MetadataExt;
+use std::rc::Rc;
 
 use crate::builtins::fmt_duration;
-use crate::shell::{Shell, Val};
+use crate::shell::{GitBranchCache, GitCache, Shell, Val};
 use crate::sys;
 
 pub fn char_width(c: char) -> usize {
@@ -85,21 +87,21 @@ fn find_git_dir(cwd: &str) -> Option<String> {
 }
 
 /// Current git branch, or a short commit hash when detached. The repository
-/// lookup is cached per cwd (and `GIT_DIR`), so repeating the prompt in the same
-/// directory only reads `HEAD` instead of walking the tree.
-pub fn git_branch(sh: &mut Shell, cwd: &str) -> Option<String> {
-    let gd_env = sh.get("GIT_DIR").filter(|s| !s.is_empty());
+/// lookup is cached per cwd (and `GIT_DIR`), and the branch is cached by `HEAD`
+/// metadata. Repeating the prompt in the same repository therefore costs one
+/// `stat`, not a directory walk plus an open/read/close cycle.
+pub fn git_branch<'a>(sh: &'a mut Shell, cwd: &str) -> Option<&'a str> {
+    let gd_env = var_str(sh, "GIT_DIR").filter(|s| !s.is_empty());
     let hit = match &sh.git_cache {
-        Some((c, g, Some(_))) if c == cwd && *g == gd_env => true,
-        Some((c, g, None)) if c == cwd && *g == gd_env => {
-            // Negative result: trust it only while `cwd` still has no `.git`, so
-            // a fresh `git init` is picked up on the next prompt.
-            gd_env.is_none() && !std::path::Path::new(cwd).join(".git").exists()
+        Some(c) if c.cwd == cwd && c.git_dir_env.as_deref() == gd_env => {
+            c.git_dir.is_some()
+                || (c.git_dir_env.is_none() && !std::path::Path::new(&*c.dot_git).exists())
         }
         _ => false,
     };
     if !hit {
-        let d = match &gd_env {
+        let gd_owned = gd_env.map(str::to_string);
+        let d = match &gd_owned {
             Some(gd) => {
                 let p = std::path::PathBuf::from(gd);
                 let abs = if p.is_absolute() { p } else { std::path::PathBuf::from(cwd).join(p) };
@@ -107,28 +109,60 @@ pub fn git_branch(sh: &mut Shell, cwd: &str) -> Option<String> {
             }
             None => find_git_dir(cwd),
         };
-        sh.git_cache = Some((cwd.to_string(), gd_env, d));
+        let head_path = d.as_ref().map(|d| Rc::<str>::from(format!("{}/HEAD", d)));
+        if head_path.is_none() {
+            sh.git_branch_cache = None;
+        }
+        let dot_git = Rc::<str>::from(format!("{}/.git", cwd));
+        sh.git_cache = Some(GitCache {
+            cwd: cwd.to_string(),
+            git_dir_env: gd_owned,
+            git_dir: d,
+            head_path,
+            dot_git,
+        });
     }
-    let dir = sh.git_cache.as_ref().and_then(|(_, _, d)| d.as_deref())?;
-    let head = match std::fs::read_to_string(std::path::Path::new(dir).join("HEAD")) {
+
+    let (head_path, stamp) = {
+        let c = sh.git_cache.as_ref()?;
+        let head_path = Rc::clone(c.head_path.as_ref()?);
+        let stamp = std::fs::metadata(&*head_path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len(), m.ino())));
+        (head_path, stamp)
+    };
+    let cached = match &sh.git_branch_cache {
+        Some(bc) => {
+            (Rc::ptr_eq(&bc.head_path, &head_path) || &*bc.head_path == &*head_path)
+                && bc.stamp.is_some()
+                && bc.stamp == stamp
+        }
+        None => false,
+    };
+    if cached {
+        return sh.git_branch_cache.as_ref().and_then(|bc| bc.branch.as_deref());
+    }
+    let head = match std::fs::read_to_string(&*head_path) {
         Ok(h) => h,
         Err(_) => {
             // Repository moved or disappeared; force a fresh lookup next time.
             sh.git_cache = None;
+            sh.git_branch_cache = None;
             return None;
         }
     };
     let head = head.trim();
-    Some(match head.strip_prefix("ref: refs/heads/") {
+    let branch = match head.strip_prefix("ref: refs/heads/") {
         Some(b) => b.to_string(),
         None => head.chars().take(7).collect(),
-    })
+    };
+    sh.git_branch_cache = Some(GitBranchCache { head_path, branch: Some(branch), stamp });
+    sh.git_branch_cache.as_ref().and_then(|bc| bc.branch.as_deref())
 }
 
-fn tilde(sh: &mut Shell, p: &str) -> String {
-    let home = sh.home();
+fn tilde_str(home: &str, p: &str) -> String {
     if home.len() > 1
-        && (p == home || (p.starts_with(home.as_str()) && p.as_bytes().get(home.len()) == Some(&b'/')))
+        && (p == home || (p.starts_with(home) && p.as_bytes().get(home.len()) == Some(&b'/')))
     {
         let mut s = String::with_capacity(p.len() - home.len() + 1);
         s.push('~');
@@ -136,6 +170,59 @@ fn tilde(sh: &mut Shell, p: &str) -> String {
         s
     } else {
         p.to_string()
+    }
+}
+
+fn var_str<'a>(sh: &'a Shell, name: &str) -> Option<&'a str> {
+    sh.var(name).and_then(|v| match &v.val {
+        Val::Str(s) => Some(s.as_str()),
+        Val::Arr(a) => a.first().map(String::as_str),
+        Val::Map(m) => m.iter().find(|(k, _)| k == "0").map(|(_, v)| v.as_str()),
+        Val::Unset => None,
+    })
+}
+
+/// Cached `PWD`, `HOME` and the tilde-shortened cwd. Prompt caches keep this
+/// across renders, so an unchanged directory costs no string allocation at all.
+struct PathCache {
+    valid: bool,
+    pwd_var: Option<String>,
+    home_var: Option<String>,
+    pwd: String,
+    home: String,
+    tilde: String,
+}
+
+impl PathCache {
+    fn new() -> PathCache {
+        PathCache {
+            valid: false,
+            pwd_var: None,
+            home_var: None,
+            pwd: String::new(),
+            home: String::new(),
+            tilde: String::new(),
+        }
+    }
+
+    fn get<'a>(&'a mut self, sh: &mut Shell) -> (&'a str, &'a str) {
+        let pwd_now = var_str(sh, "PWD");
+        let home_now = var_str(sh, "HOME");
+        let pwd_changed = !self.valid || self.pwd_var.as_deref() != pwd_now;
+        let home_changed = !self.valid || self.home_var.as_deref() != home_now;
+        if pwd_changed {
+            self.pwd = sh.cwd();
+            self.pwd_var = var_str(sh, "PWD").map(str::to_string);
+        }
+        if home_changed {
+            self.home = sh.home();
+            self.home_var = var_str(sh, "HOME").map(str::to_string);
+        }
+        if pwd_changed || home_changed {
+            self.tilde = tilde_str(&self.home, &self.pwd);
+        }
+        self.valid = true;
+        (&self.pwd, &self.tilde)
     }
 }
 
@@ -183,6 +270,8 @@ enum Seg {
 pub struct PromptPlan {
     segs: Vec<Seg>,
     expand: bool,
+    is_root: bool,
+    uses_path: bool,
 }
 
 fn flush(segs: &mut Vec<Seg>, lit: &mut String) {
@@ -365,7 +454,13 @@ impl PromptPlan {
             }
         }
         flush(&mut segs, &mut lit);
-        PromptPlan { segs, expand }
+        let uses_path = segs.iter().any(|s| {
+            matches!(
+                s,
+                Seg::Cwd | Seg::CwdBase | Seg::CwdStyled | Seg::Git | Seg::GitStyled
+            )
+        });
+        PromptPlan { segs, expand, is_root, uses_path }
     }
 }
 
@@ -391,17 +486,26 @@ fn has_utf8(v: &str) -> bool {
         || b.windows(5).any(|w| w.eq_ignore_ascii_case(b"utf-8"))
 }
 
-fn utf8_locale(sh: &Shell) -> bool {
-    for k in ["LC_ALL", "LC_CTYPE", "LANG"] {
-        if let Some(v) = sh.var(k) {
-            if let Val::Str(s) = &v.val {
-                if !s.is_empty() {
-                    return has_utf8(s);
+fn utf8_locale(sh: &mut Shell) -> bool {
+    if let Some(v) = sh.prompt_utf8 {
+        return v;
+    }
+    let v = {
+        let mut v = false;
+        for k in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            if let Some(var) = sh.var(k) {
+                if let Val::Str(s) = &var.val {
+                    if !s.is_empty() {
+                        v = has_utf8(s);
+                        break;
+                    }
                 }
             }
         }
-    }
-    false
+        v
+    };
+    sh.prompt_utf8 = Some(v);
+    v
 }
 
 fn push_userhost(sh: &mut Shell, out: &mut String, protect: bool) {
@@ -417,17 +521,16 @@ fn push_userhost(sh: &mut Shell, out: &mut String, protect: bool) {
     out.push_str("\x1b[0m ");
 }
 
-fn push_cwd_seg(sh: &mut Shell, cwd: &str, out: &mut String, protect: bool) {
-    let t = tilde(sh, cwd);
+fn push_cwd_seg(t: &str, out: &mut String, protect: bool) {
     out.push_str("\x1b[1;34m");
-    push_protected(out, &t, protect);
+    push_protected(out, t, protect);
     out.push_str("\x1b[0m");
 }
 
 fn push_git_seg(sh: &mut Shell, cwd: &str, out: &mut String, protect: bool) {
     if let Some(b) = git_branch(sh, cwd) {
         out.push_str(" \x1b[35m(");
-        push_protected(out, &b, protect);
+        push_protected(out, b, protect);
         out.push_str(")\x1b[0m");
     }
 }
@@ -457,8 +560,8 @@ fn push_status_seg(sh: &Shell, out: &mut String) {
     }
 }
 
-fn push_symbol_seg(sh: &mut Shell, out: &mut String) {
-    let sym = if unsafe { libc::geteuid() } == 0 {
+fn push_symbol_seg(sh: &mut Shell, is_root: bool, out: &mut String) {
+    let sym = if is_root {
         "#"
     } else if utf8_locale(sh) {
         "❯"
@@ -471,10 +574,14 @@ fn push_symbol_seg(sh: &mut Shell, out: &mut String) {
     out.push_str("\x1b[0m ");
 }
 
-fn render_plan(sh: &mut Shell, plan: &PromptPlan, out: &mut String) {
+fn render_plan(sh: &mut Shell, plan: &PromptPlan, out: &mut String, paths: &mut PathCache) {
     let mut now: Option<i64> = None;
-    // `\C` and `\G` (and `\w` plus `\g`) all need the cwd; fetch PWD once.
-    let mut cwd_cache: Option<String> = None;
+    // Resolve PWD/HOME/tilde once per render, and only when the plan uses them.
+    let (cwd, t) = if plan.uses_path {
+        paths.get(sh)
+    } else {
+        ("", "")
+    };
     for seg in &plan.segs {
         match seg {
             Seg::Lit(s) => out.push_str(s),
@@ -490,20 +597,14 @@ fn render_plan(sh: &mut Shell, plan: &PromptPlan, out: &mut String) {
                 let host = sh.hostname();
                 push_protected(out, host, plan.expand);
             }
-            Seg::Cwd => {
-                let cwd = cwd_cache.get_or_insert_with(|| sh.cwd());
-                let t = tilde(sh, cwd);
-                push_protected(out, &t, plan.expand);
-            }
+            Seg::Cwd => push_protected(out, t, plan.expand),
             Seg::CwdBase => {
-                let cwd = cwd_cache.get_or_insert_with(|| sh.cwd());
-                let t = tilde(sh, cwd);
                 let base = if t == "~" || t == "/" {
                     t
                 } else {
-                    t.rsplit('/').next().unwrap_or("").to_string()
+                    t.rsplit('/').next().unwrap_or("")
                 };
-                push_protected(out, &base, plan.expand);
+                push_protected(out, base, plan.expand);
             }
             Seg::Jobs => {
                 let _ = write!(out, "{}", sh.jobs.len());
@@ -512,9 +613,8 @@ fn render_plan(sh: &mut Shell, plan: &PromptPlan, out: &mut String) {
                 let _ = write!(out, "{}", sh.history.entries.len() + 1);
             }
             Seg::Git => {
-                let cwd = cwd_cache.get_or_insert_with(|| sh.cwd());
                 if let Some(b) = git_branch(sh, cwd) {
-                    push_protected(out, &b, plan.expand);
+                    push_protected(out, b, plan.expand);
                 }
             }
             Seg::Status => {
@@ -551,18 +651,12 @@ fn render_plan(sh: &mut Shell, plan: &PromptPlan, out: &mut String) {
                 push_protected(out, &s, plan.expand);
             }
             Seg::UserHost => push_userhost(sh, out, plan.expand),
-            Seg::CwdStyled => {
-                let cwd = cwd_cache.get_or_insert_with(|| sh.cwd());
-                push_cwd_seg(sh, cwd, out, plan.expand);
-            }
-            Seg::GitStyled => {
-                let cwd = cwd_cache.get_or_insert_with(|| sh.cwd());
-                push_git_seg(sh, cwd, out, plan.expand);
-            }
+            Seg::CwdStyled => push_cwd_seg(t, out, plan.expand),
+            Seg::GitStyled => push_git_seg(sh, cwd, out, plan.expand),
             Seg::JobsStyled => push_jobs_seg(sh, out),
             Seg::DurationStyled => push_duration_seg(sh, out, plan.expand),
             Seg::StatusStyled => push_status_seg(sh, out),
-            Seg::SymbolStyled => push_symbol_seg(sh, out),
+            Seg::SymbolStyled => push_symbol_seg(sh, plan.is_root, out),
         }
     }
     if plan.expand {
@@ -579,7 +673,7 @@ fn render_plan(sh: &mut Shell, plan: &PromptPlan, out: &mut String) {
 pub fn expand_prompt(sh: &mut Shell, ps: &str) -> String {
     let plan = PromptPlan::compile(ps);
     let mut out = String::with_capacity(ps.len() + 16);
-    render_plan(sh, &plan, &mut out);
+    render_plan(sh, &plan, &mut out, &mut PathCache::new());
     out
 }
 
@@ -604,6 +698,7 @@ pub struct PromptCache {
     src: String,
     plan: PromptPlan,
     out: String,
+    paths: PathCache,
 }
 
 impl PromptCache {
@@ -612,6 +707,7 @@ impl PromptCache {
             src: String::new(),
             plan: PromptPlan::compile(""),
             out: String::new(),
+            paths: PathCache::new(),
         }
     }
 
@@ -632,7 +728,7 @@ impl PromptCache {
             self.plan = PromptPlan::compile(&self.src);
         }
         self.out.clear();
-        render_plan(sh, &self.plan, &mut self.out);
+        render_plan(sh, &self.plan, &mut self.out, &mut self.paths);
         &self.out
     }
 }
@@ -704,6 +800,34 @@ mod tests {
     }
 
     #[test]
+    fn path_cache_tracks_cwd_and_home() {
+        let mut sh = Shell::new();
+        let _ = sh.set_str("PS1", "\\w");
+        let _ = sh.set_str("HOME", "/home/test");
+        let _ = sh.set_str("PWD", "/home/test/project");
+        let mut c = PromptCache::new();
+        assert_eq!(c.render(&mut sh, &["PS1"], DEFAULT_PS1), "~/project");
+        let _ = sh.set_str("PWD", "/tmp");
+        assert_eq!(c.render(&mut sh, &["PS1"], DEFAULT_PS1), "/tmp");
+        let _ = sh.set_str("HOME", "/tmp");
+        assert_eq!(c.render(&mut sh, &["PS1"], DEFAULT_PS1), "~");
+    }
+
+    #[test]
+    fn utf8_locale_cache_invalidates() {
+        let mut sh = Shell::new();
+        let _ = sh.set_str("LC_ALL", "C");
+        let _ = sh.set_str("LC_CTYPE", "");
+        let _ = sh.set_str("LANG", "");
+        assert!(!utf8_locale(&mut sh));
+        let _ = sh.set_str("LC_ALL", "en_US.UTF-8");
+        assert!(utf8_locale(&mut sh));
+        let _ = sh.unset_var("LC_ALL");
+        let _ = sh.set_str("LANG", "C");
+        assert!(!utf8_locale(&mut sh));
+    }
+
+    #[test]
     fn git_init_after_negative_cache() {
         let base = std::env::temp_dir().join(format!("nash-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -713,7 +837,19 @@ mod tests {
         assert_eq!(git_branch(&mut sh, &cwd), None, "empty dir");
         std::fs::create_dir_all(base.join(".git")).unwrap();
         std::fs::write(base.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        assert_eq!(git_branch(&mut sh, &cwd).as_deref(), Some("main"), "after init");
+        assert_eq!(git_branch(&mut sh, &cwd), Some("main"), "after init");
+        // The cached branch must be invalidated when HEAD changes, including
+        // when the checkout changes the file size.
+        std::fs::write(base.join(".git/HEAD"), "ref: refs/heads/feature\n").unwrap();
+        assert_eq!(git_branch(&mut sh, &cwd), Some("feature"), "after checkout");
+        // Atomic replacement changes the inode even if the size is identical.
+        let tmp = base.join(".git/HEAD.tmp");
+        std::fs::write(&tmp, "ref: refs/heads/branch1\n").unwrap();
+        std::fs::rename(&tmp, base.join(".git/HEAD")).unwrap();
+        assert_eq!(git_branch(&mut sh, &cwd), Some("branch1"), "atomic replace");
+        // Detached HEAD displays a short hash.
+        std::fs::write(base.join(".git/HEAD"), "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+        assert_eq!(git_branch(&mut sh, &cwd), Some("0123456"), "detached");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

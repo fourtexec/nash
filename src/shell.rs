@@ -136,6 +136,32 @@ impl Job {
     }
 }
 
+/// Resolved repository lookup for one `(cwd, GIT_DIR)` pair. `head_path` is
+/// precomputed so prompt rendering never has to build a path.
+pub(crate) struct GitCache {
+    pub(crate) cwd: String,
+    pub(crate) git_dir_env: Option<String>,
+    pub(crate) git_dir: Option<String>,
+    pub(crate) head_path: Option<Rc<str>>,
+    /// Precomputed `<cwd>/.git`, used to invalidate the negative cache without
+    /// allocating a `PathBuf` on every prompt.
+    pub(crate) dot_git: Rc<str>,
+}
+
+/// Cached branch name, keyed by the resolved `HEAD` path and its metadata.
+/// Re-reading is only needed when `HEAD`'s mtime, size, or inode changes.
+pub(crate) struct GitBranchCache {
+    pub(crate) head_path: Rc<str>,
+    pub(crate) branch: Option<String>,
+    /// `(mtime, size, inode)`. The inode catches atomic `HEAD` replacement even
+    /// when the timestamp resolution and file size happen to match.
+    pub(crate) stamp: Option<(std::time::SystemTime, u64, u64)>,
+}
+
+fn is_locale_var(name: &str) -> bool {
+    name == "LC_ALL" || name == "LC_CTYPE" || name == "LANG"
+}
+
 pub struct Shell {
     pub scopes: Vec<HashMap<String, Var>>,
     pub pos_params: Vec<String>,
@@ -187,10 +213,16 @@ pub struct Shell {
     /// Host name, cached once at startup so prompt escapes never call
     /// `gethostname` or allocate on every prompt.
     hostname: String,
+    /// Cached UTF-8 locale detection for the prompt symbol. Invalidated when
+    /// one of the locale variables changes.
+    pub(crate) prompt_utf8: Option<bool>,
     /// Cache of the resolved git directory for the last prompt's cwd and
-    /// `GIT_DIR`, so the common case only reads `HEAD` instead of walking the
-    /// tree. `None` in the last slot means "not inside a repository".
-    pub(crate) git_cache: Option<(String, Option<String>, Option<String>)>,
+    /// `GIT_DIR`, so the common case only stats `HEAD` instead of walking the
+    /// tree. `git_dir: None` means "not inside a repository".
+    pub(crate) git_cache: Option<GitCache>,
+    /// Last branch name and `HEAD` metadata, so a prompt in the same
+    /// repository does not re-read the file when it has not changed.
+    pub(crate) git_branch_cache: Option<GitBranchCache>,
 }
 
 impl Shell {
@@ -254,7 +286,9 @@ impl Shell {
             home_dir: None,
             user_name: None,
             hostname: String::new(),
+            prompt_utf8: None,
             git_cache: None,
+            git_branch_cache: None,
         };
         let host = sys::hostname();
         sh.hostname = host.clone();
@@ -376,6 +410,9 @@ impl Shell {
         if name == "PATH" {
             self.hash.clear();
         }
+        if is_locale_var(name) {
+            self.prompt_utf8 = None;
+        }
         Ok(())
     }
 
@@ -397,10 +434,16 @@ impl Shell {
                 self.scopes[top].insert(name.to_string(), Var { val, exported: false, readonly: false });
             }
         }
+        if is_locale_var(name) {
+            self.prompt_utf8 = None;
+        }
         Ok(())
     }
 
     pub fn var_mut(&mut self, name: &str) -> Option<&mut Var> {
+        if is_locale_var(name) {
+            self.prompt_utf8 = None;
+        }
         let idx = self.scope_of(name)?;
         self.scopes[idx].get_mut(name)
     }
@@ -417,6 +460,9 @@ impl Shell {
             }
             if name == "PATH" {
                 self.hash.clear();
+            }
+            if is_locale_var(name) {
+                self.prompt_utf8 = None;
             }
         }
         Ok(())
