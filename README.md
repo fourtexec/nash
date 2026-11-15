@@ -72,8 +72,12 @@ nash update 0.1.0
 installs exactly that release, older ones included (`nash update dev7` works
 too). `nash update --list` shows what is available for your platform,
 `--check` only reports whether there is something to install (exit status 1 if
-so) and `--force` reinstalls the version you already have. As with `install`,
-run a script called `update` as `nash ./update`.
+so) and `--force` reinstalls the version you already have.
+
+To install a binary you already have, without any download, give its path (with
+a `/` in it): `nash update ./nash-linux-x86_64`. It gets the same checks: it
+must be built for this operating system and CPU, run here and report itself as
+nash. As with `install`, run a script called `update` as `nash ./update`.
 
 Releases are made by the workflow in `.github/workflows/release.yml`: every
 push to `main` is a development build tagged `dev1`, `dev2`, `dev3`, ..., and
