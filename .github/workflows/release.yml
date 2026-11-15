@@ -4,7 +4,10 @@ name: release
 # publishes the binaries `nash update` downloads.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check that the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
@@ -43,8 +47,43 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
+  build-android-termux:
+    name: Build Android (Termux, aarch64, latest NDK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r30
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build --release --locked --target aarch64-linux-android
+      - name: Rename the binary
+        run: cp target/aarch64-linux-android/release/nash nash-android-aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nash-android-aarch64
+          path: nash-android-aarch64
+
   release:
-    needs: build
+    needs: [build, build-android-termux]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
