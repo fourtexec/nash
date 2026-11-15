@@ -1050,6 +1050,10 @@ impl Shell {
             let line = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
             self.xtrace(&line);
         }
+        if !sc.assigns.is_empty() && sc.assigns.iter().any(|a| a.append) && !argv.is_empty() {
+            sherr!("nash: append assignment not allowed as environment prefix");
+            return Ok(2);
+        }
         self.dispatch(argv, &sc.assigns, &sc.redirs, direct, false)
     }
 
