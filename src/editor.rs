@@ -984,10 +984,12 @@ impl<'a> Editor<'a> {
                 }
                 Key::Alt('\n') => self.insert_str("\n"),
                 Key::Ctrl('c') => {
+                    // Match fish behavior: clear the line and return Interrupt,
+                    // without printing ^C or a newline. The terminal may show ^C
+                    // on its own, and the prompt will be redrawn on the next loop.
+                    self.buf.clear();
+                    self.cur = 0;
                     self.finish();
-                    // Match fish behavior: print ^C and a newline on stdout,
-                    // so the prompt appears on the next line.
-                    sys::write_fd(1, b"^C\n");
                     return Input::Interrupt;
                 }
                 Key::Ctrl('d') => {
