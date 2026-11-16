@@ -485,6 +485,9 @@ impl Shell {
                     Some(s) => s,
                     None => {
                         if sys::errno() == sys::EINTR {
+                            if let Err(f) = self.check_signals() {
+                                return Err(f);
+                            }
                             continue;
                         }
                         sts[i] = 127;
@@ -811,6 +814,10 @@ impl Shell {
                 Some(s) => s,
                 None => {
                     if sys::errno() == sys::EINTR {
+                        if let Err(_) = self.check_signals() {
+                            // propagate interrupt by returning 130
+                            return 130;
+                        }
                         continue;
                     }
                     return 127;

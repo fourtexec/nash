@@ -37,6 +37,7 @@ enum Key {
     Esc,
     Eof,
     Resize,
+    Interrupt,
     Unknown,
 }
 
@@ -202,7 +203,10 @@ fn poll_byte(ms: i32) -> Option<u8> {
     let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
     let r = sys::poll(&mut [pfd], ms);
     if r > 0 {
-        sys::read_byte(0).ok().flatten()
+        match sys::read_byte(0) {
+            Ok(Some(b)) => Some(b),
+            _ => None,
+        }
     } else {
         None
     }
@@ -212,14 +216,24 @@ fn read_key() -> Key {
     let b = match sys::read_byte(0) {
         Ok(Some(b)) => b,
         Ok(None) => return Key::Eof,
-        Err(e) if e == libc::EINTR => return Key::Resize,
+        Err(e) if e == libc::EINTR => {
+            if sys::take_pending(libc::SIGINT) {
+                return Key::Interrupt;
+            }
+            return Key::Resize;
+        }
         Err(_) => return Key::Eof,
     };
     match b {
         0x1b => {
             let b = match poll_byte(40) {
                 Some(b) => b,
-                None => return Key::Esc,
+                None => {
+                    if sys::take_pending(libc::SIGINT) {
+                        return Key::Interrupt;
+                    }
+                    return Key::Esc;
+                }
             };
             match b {
                 b'[' => {
@@ -232,7 +246,12 @@ fn read_key() -> Key {
                                     break;
                                 }
                             }
-                            None => return Key::Unknown,
+                            None => {
+                                if sys::take_pending(libc::SIGINT) {
+                                    return Key::Interrupt;
+                                }
+                                return Key::Unknown;
+                            }
                         }
                     }
                     match seq.as_str() {
@@ -259,7 +278,12 @@ fn read_key() -> Key {
                                             break;
                                         }
                                     }
-                                    Err(e) if e == libc::EINTR => continue,
+                                    Err(e) if e == libc::EINTR => {
+                                        if sys::take_pending(libc::SIGINT) {
+                                            return Key::Interrupt;
+                                        }
+                                        continue;
+                                    }
                                     _ => break,
                                 }
                             }
@@ -301,10 +325,14 @@ fn read_key() -> Key {
             };
             let mut bytes = vec![b];
             while bytes.len() < n {
-                match sys::read_byte(0) {
-                    Ok(Some(c)) => bytes.push(c),
-                    Err(e) if e == libc::EINTR => continue,
-                    _ => return Key::Unknown,
+                match poll_byte(40) {
+                    Some(c) => bytes.push(c),
+                    None => {
+                        if sys::take_pending(libc::SIGINT) {
+                            return Key::Interrupt;
+                        }
+                        return Key::Unknown;
+                    }
                 }
             }
             match std::str::from_utf8(&bytes).ok().and_then(|s| s.chars().next()) {
@@ -1008,6 +1036,10 @@ impl<'a> Editor<'a> {
     fn run(&mut self) -> Input {
         loop {
             let key = read_key();
+            if key == Key::Interrupt {
+                self.finish();
+                return Input::Interrupt;
+            }
             if self.search.is_some() && self.search_key(&key) {
                 self.refresh();
                 continue;
