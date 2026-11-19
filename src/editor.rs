@@ -1168,12 +1168,21 @@ impl<'a> Editor<'a> {
                     }
                 }
                 Key::Up | Key::Ctrl('p') => {
-                    if !(self.hist_idx.is_none() && self.line_move(true)) {
+                    // If the cursor sits at the very end of the buffer, treat
+                    // Up/Down as plain history navigation (previous command).
+                    // Otherwise (cursor moved into the body of a multi-line
+                    // command) move by lines first, and only fall through to
+                    // history on the first line, like fish's up-or-search.
+                    if self.cur == self.buf.len() {
+                        self.hist_move(true);
+                    } else if !self.line_move(true) {
                         self.hist_move(true);
                     }
                 }
                 Key::Down | Key::Ctrl('n') => {
-                    if !(self.hist_idx.is_none() && self.line_move(false)) {
+                    if self.cur == self.buf.len() {
+                        self.hist_move(false);
+                    } else if !self.line_move(false) {
                         self.hist_move(false);
                     }
                 }
