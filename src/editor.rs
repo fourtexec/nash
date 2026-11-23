@@ -409,7 +409,20 @@ impl<'a> Editor<'a> {
             None => self.prompt.clone(),
         };
         p.out.push_str(&prompt);
-        p.col = visible_width(&prompt) % cols;
+        // The prompt itself may wrap over several screen rows when it is longer
+        // than the terminal width.  Keep the painter in sync with the real
+        // cursor, otherwise `self.row` (the number of rows to move back up on
+        // the next refresh) misses the prompt's own wraps and every keystroke
+        // redraws the prompt one line further down.
+        let prompt_w = visible_width(&prompt);
+        p.row = prompt_w / cols;
+        p.col = prompt_w % cols;
+        if p.col == 0 && prompt_w > 0 {
+            // A terminal defers the wrap at the right margin until the next
+            // printable character, while Painter::put() wraps eagerly.  Force
+            // it now so subsequent bookkeeping matches.
+            p.out.push_str("\r\n");
+        }
         let styles = if self.buf.len() < 5000 { highlight(self.sh, &self.buf) } else { vec![St::Plain; self.buf.len()] };
         let mut cur_pos = (0, p.col);
         let mut last = St::Plain;
