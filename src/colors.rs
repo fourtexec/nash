@@ -40,11 +40,36 @@ pub fn setup(sh: &mut Shell) {
         sh.export_var("LS_COLORS");
     }
     let quiet = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    let has_grep_color = || {
+        use std::io::Write;
+        let mut child = match std::process::Command::new("grep")
+            .args(["--color=auto", "-q", "x"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"x\n");
+        }
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    };
+    let has_gnu_ls = quiet("ls", &["--color=auto", "-d", "/"]);
+    let has_grep = has_grep_color();
+    let has_diff = quiet("diff", &["--color=auto", "/dev/null", "/dev/null"]);
+    let has_tree = sh.find_command("tree").is_some();
+    if !has_gnu_ls {
+        let _ = sh.set_str("CLICOLOR", "1");
+        sh.export_var("CLICOLOR");
+    }
     let a = Rc::make_mut(&mut sh.aliases);
     let mut add = |k: &str, v: &str| {
         a.entry(k.to_string()).or_insert_with(|| v.to_string());
     };
-    if quiet("ls", &["--color=auto", "-d", "/"]) {
+    if has_gnu_ls {
         // GNU ls
         add("ls", "ls --color=auto");
         for c in ["dir", "vdir"] {
@@ -53,26 +78,20 @@ pub fn setup(sh: &mut Shell) {
     } else {
         // BSD / macOS ls
         add("ls", "ls -G");
-        let _ = sh.set_str("CLICOLOR", "1");
-        sh.export_var("CLICOLOR");
     }
-    let a = Rc::make_mut(&mut sh.aliases);
-    let mut add = |k: &str, v: &str| {
-        a.entry(k.to_string()).or_insert_with(|| v.to_string());
-    };
     add("la", "ls -A");
     add("ll", "ls -lh");
     add("lla", "ls -lAh");
     add("l", "ls -CF");
-    if quiet("grep", &["--color=auto", "-q", "x", "/dev/null"]) || quiet("sh", &["-c", "echo x | grep --color=auto -q x"]) {
+    if has_grep {
         for c in ["grep", "egrep", "fgrep"] {
             add(c, &format!("{} --color=auto", c));
         }
     }
-    if quiet("sh", &["-c", "diff --color=auto /dev/null /dev/null"]) {
+    if has_diff {
         add("diff", "diff --color=auto");
     }
-    if quiet("sh", &["-c", "command -v tree"]) {
+    if has_tree {
         add("tree", "tree -C");
     }
 }

@@ -34,21 +34,23 @@ fn fmt_time(t: f64) -> String {
 pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let mut prev2: Vec<usize> = vec![0; b.len() + 1];
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let m = b.len();
+    let mut prev2: Vec<usize> = vec![0; m + 1];
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur: Vec<usize> = vec![0; m + 1];
     for i in 1..=a.len() {
-        let mut cur = vec![i; b.len() + 1];
-        for j in 1..=b.len() {
+        cur[0] = i;
+        for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
             cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
                 cur[j] = cur[j].min(prev2[j - 2] + 1);
             }
         }
-        prev2 = prev;
-        prev = cur;
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
     }
-    prev[b.len()]
+    prev[m]
 }
 
 impl Shell {
@@ -662,8 +664,8 @@ impl Shell {
     /// Can the last element of a pipeline run in the current shell (zsh style)?
     fn can_lastpipe(&self, cmd: &Cmd) -> bool {
         match cmd {
-            Cmd::Simple(sc) => match sc.words.first().and_then(word_literal) {
-                Some(name) => self.funcs.contains_key(&name) || crate::builtins::is_builtin(&name),
+            Cmd::Simple(sc) => match sc.words.first().and_then(word_literal_str) {
+                Some(name) => self.funcs.contains_key(name) || crate::builtins::is_builtin(name),
                 None => false,
             },
             Cmd::Subshell(_) | Cmd::Pipeline { .. } => false,
@@ -875,7 +877,8 @@ impl Shell {
         }
         let dir = self.get("TMPDIR").unwrap_or_else(|| "/tmp".into());
         for n in 0..100 {
-            let path = format!("{}/nash-heredoc-{}-{}-{}", dir, sys::getpid(), self.rng % 100000, n);
+            let rand = self.next_random();
+            let path = format!("{}/nash-heredoc-{}-{:016x}-{}", dir, sys::getpid(), rand, n);
             let fd = sys::open(&path, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600);
             if fd >= 0 {
                 sys::write_fd(fd, s.as_bytes());
@@ -945,22 +948,28 @@ impl Shell {
                 }
                 kind => {
                     let t = self.expand_word_str(&r.target)?;
-                    let flags = match kind {
-                        RedirKind::In => libc::O_RDONLY,
-                        RedirKind::RW => libc::O_RDWR | libc::O_CREAT,
-                        RedirKind::Append | RedirKind::AppendErr => libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
-                        RedirKind::Out if self.opts.noclobber && std::fs::metadata(&t).map(|m| m.is_file()).unwrap_or(false) => {
-                            sherr!("{}: cannot overwrite existing file", t);
+                    if matches!(kind, RedirKind::Out) && self.opts.noclobber {
+                        match sys::open_noclobber(&t) {
+                            Ok(f) => f,
+                            Err(msg) => {
+                                sherr!("{}: {}", t, msg);
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        let flags = match kind {
+                            RedirKind::In => libc::O_RDONLY,
+                            RedirKind::RW => libc::O_RDWR | libc::O_CREAT,
+                            RedirKind::Append | RedirKind::AppendErr => libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                            _ => libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                        };
+                        let f = sys::open(&t, flags, 0o666);
+                        if f < 0 {
+                            sherr!("{}: {}", t, sys::last_error());
                             return Ok(false);
                         }
-                        _ => libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                    };
-                    let f = sys::open(&t, flags, 0o666);
-                    if f < 0 {
-                        sherr!("{}: {}", t, sys::last_error());
-                        return Ok(false);
+                        f
                     }
-                    f
                 }
             };
             if newfd < 0 {
@@ -1015,12 +1024,12 @@ impl Shell {
 
     fn exec_simple2(&mut self, sc: &SimpleCmd, direct: bool) -> R {
         self.last_subst = None;
-        if let Some(l) = sc.words.first().and_then(word_literal) {
-            if DECL.contains(&l.as_str()) && !self.funcs.contains_key(&l) {
+        if let Some(l) = sc.words.first().and_then(word_literal_str) {
+            if DECL.contains(&l) && !self.funcs.contains_key(l) {
                 let mut saved = Vec::new();
                 let ok = self.apply_redirs(&sc.redirs, Some(&mut saved));
                 let r = match ok {
-                    Ok(true) => self.exec_decl(&l, sc),
+                    Ok(true) => self.exec_decl(l, sc),
                     Ok(false) => Ok(1),
                     Err(e) => Err(e),
                 };
@@ -1249,14 +1258,45 @@ impl Shell {
 
     /// Replace the current process with an external program. Never returns.
     pub fn do_exec(&mut self, path: &str, argv: &[String], extra_env: &[(String, String)]) -> ! {
-        let mut env = self.environ();
-        for (k, v) in extra_env {
-            env.insert(k.clone(), v.clone());
-        }
-        let c = |s: &str| CString::new(s.replace('\0', "")).unwrap();
+        let c = |s: &str| {
+            if !s.as_bytes().contains(&0) {
+                CString::new(s).unwrap()
+            } else {
+                CString::new(s.replace('\0', "")).unwrap()
+            }
+        };
+        let make_env = |k: &str, v: &str| -> CString {
+            let mut buf = Vec::with_capacity(k.len() + 1 + v.len());
+            for &b in k.as_bytes() {
+                if b != 0 {
+                    buf.push(b);
+                }
+            }
+            buf.push(b'=');
+            for &b in v.as_bytes() {
+                if b != 0 {
+                    buf.push(b);
+                }
+            }
+            CString::new(buf).unwrap()
+        };
         let cpath = c(path);
         let cargs: Vec<CString> = argv.iter().map(|a| c(a)).collect();
-        let cenv: Vec<CString> = env.iter().map(|(k, v)| c(&format!("{}={}", k, v))).collect();
+        let cenv: Vec<CString> = if self.scopes.len() == 1 && extra_env.is_empty() {
+            self.scopes[0]
+                .iter()
+                .filter_map(|(k, v)| match &v.val {
+                    Val::Str(val) if v.exported => Some(make_env(k, val)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            let mut env = self.environ();
+            for (k, v) in extra_env {
+                env.insert(k.clone(), v.clone());
+            }
+            env.iter().map(|(k, v)| make_env(k, v)).collect()
+        };
         let mut pargs: Vec<*const libc::c_char> = cargs.iter().map(|a| a.as_ptr()).collect();
         pargs.push(std::ptr::null());
         let mut penv: Vec<*const libc::c_char> = cenv.iter().map(|a| a.as_ptr()).collect();

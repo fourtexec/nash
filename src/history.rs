@@ -88,16 +88,14 @@ impl History {
             self.entries.drain(..cut);
         }
         if lines > self.max * 2 {
-            // compact the file
+            // compact the file atomically with restrictive permissions
             let body: String = self.entries.iter().map(format_entry).collect();
-            let tmp = format!("{}.tmp{}", path, std::process::id());
-            if std::fs::write(&tmp, body).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+            let _ = crate::sys::write_atomic_private(path, body.as_bytes());
         }
     }
 
     pub fn add(&mut self, e: Entry) {
+        use std::os::unix::fs::OpenOptionsExt;
         if let Some(last) = self.entries.last() {
             if last.cmd == e.cmd && last.cwd == e.cwd {
                 let n = self.entries.len() - 1;
@@ -106,7 +104,7 @@ impl History {
             }
         }
         if let Some(p) = &self.path {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p) {
                 let _ = f.write_all(format_entry(&e).as_bytes());
             }
         }
@@ -116,14 +114,15 @@ impl History {
     pub fn clear(&mut self) {
         self.entries.clear();
         if let Some(p) = &self.path {
-            let _ = std::fs::write(p, "");
+            let _ = crate::sys::write_atomic_private(p, b"");
         }
     }
 
     pub fn flush(&mut self) {
+        use std::os::unix::fs::OpenOptionsExt;
         if let Some(p) = &self.path {
             // Ensure buffered/queued writes reach disk.
-            if let Ok(f) = std::fs::OpenOptions::new().append(true).create(true).open(p) {
+            if let Ok(f) = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(p) {
                 let _ = f.sync_all();
             }
         }

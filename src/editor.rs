@@ -200,7 +200,7 @@ fn unescape_word(s: &str) -> String {
 }
 
 fn poll_byte(ms: i32) -> Option<u8> {
-    let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    let pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
     let r = sys::poll(&mut [pfd], ms);
     if r > 0 {
         match sys::read_byte(0) {
@@ -483,8 +483,7 @@ impl<'a> Editor<'a> {
                 self.suggestion = s[t.len()..].to_string();
             } else if !t.contains(char::is_whitespace) && !t.is_empty() {
                 // fish-style: suggest a command name when nothing in history matches
-                let mut names = self.sh.command_names();
-                names.sort();
+                let names = self.sh.command_names();
                 if let Some(name) = names.into_iter().find(|n| n.starts_with(&t) && n.len() > t.len()) {
                     self.suggestion = name[t.len()..].to_string();
                 }

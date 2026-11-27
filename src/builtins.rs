@@ -140,6 +140,8 @@ fn fmt_g(x: f64, prec: usize, upper: bool, alt: bool) -> String {
     }
 }
 
+const MAX_PRINTF_WIDTH: usize = 1_000_000;
+
 fn parse_int_arg(a: &str, ok: &mut bool) -> i64 {
     let t = a.trim();
     if t.is_empty() {
@@ -153,18 +155,18 @@ fn parse_int_arg(a: &str, ok: &mut bool) -> i64 {
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        i64::from_str_radix(h, 16)
+        u64::from_str_radix(h, 16)
     } else if body.len() > 1 && body.starts_with('0') {
-        i64::from_str_radix(body, 8)
+        u64::from_str_radix(body, 8)
     } else {
-        body.parse::<i64>()
+        body.parse::<u64>()
     };
     match v {
-        Ok(v) => {
+        Ok(u) => {
             if neg {
-                -v
+                (u as i64).wrapping_neg()
             } else {
-                v
+                u as i64
             }
         }
         Err(_) => {
@@ -260,11 +262,12 @@ pub fn printf_format(fmt: &str, args: &[String]) -> (String, bool) {
                 if w < 0 {
                     left = true;
                 }
-                width = w.unsigned_abs() as usize;
+                width = (w.unsigned_abs() as usize).min(MAX_PRINTF_WIDTH);
                 i += 1;
             } else {
                 while i < f.len() && f[i].is_ascii_digit() {
-                    width = width * 10 + f[i].to_digit(10).unwrap() as usize;
+                    let d = f[i].to_digit(10).unwrap() as usize;
+                    width = width.saturating_mul(10).saturating_add(d).min(MAX_PRINTF_WIDTH);
                     i += 1;
                 }
             }
@@ -273,11 +276,12 @@ pub fn printf_format(fmt: &str, args: &[String]) -> (String, bool) {
                 i += 1;
                 let mut p = 0usize;
                 if i < f.len() && f[i] == '*' {
-                    p = next(&mut ai).map(|a| parse_int_arg(&a, &mut ok)).unwrap_or(0).max(0) as usize;
+                    p = (next(&mut ai).map(|a| parse_int_arg(&a, &mut ok)).unwrap_or(0).max(0) as usize).min(MAX_PRINTF_WIDTH);
                     i += 1;
                 } else {
                     while i < f.len() && f[i].is_ascii_digit() {
-                        p = p * 10 + f[i].to_digit(10).unwrap() as usize;
+                        let d = f[i].to_digit(10).unwrap() as usize;
+                        p = p.saturating_mul(10).saturating_add(d).min(MAX_PRINTF_WIDTH);
                         i += 1;
                     }
                 }
@@ -330,8 +334,8 @@ pub fn printf_format(fmt: &str, args: &[String]) -> (String, bool) {
                     let v = next(&mut ai).map(|a| parse_int_arg(&a, &mut ok)).unwrap_or(0);
                     let mut s = v.unsigned_abs().to_string();
                     if let Some(p) = prec {
-                        while s.len() < p {
-                            s.insert(0, '0');
+                        if s.len() < p {
+                            s = format!("{}{}", "0".repeat(p - s.len()), s);
                         }
                     }
                     let s = if v < 0 { format!("-{}", s) } else { sign(s, false) };
@@ -346,8 +350,8 @@ pub fn printf_format(fmt: &str, args: &[String]) -> (String, bool) {
                         _ => format!("{:X}", v),
                     };
                     if let Some(p) = prec {
-                        while s.len() < p {
-                            s.insert(0, '0');
+                        if s.len() < p {
+                            s = format!("{}{}", "0".repeat(p - s.len()), s);
                         }
                     }
                     if alt && v != 0 {
@@ -370,7 +374,7 @@ pub fn printf_format(fmt: &str, args: &[String]) -> (String, bool) {
                             Err(_) => parse_int_arg(&a, &mut ok) as f64,
                         }
                     };
-                    let p = prec.unwrap_or(6);
+                    let p = prec.unwrap_or(6).min(1000);
                     let body = match conv {
                         'f' | 'F' => format!("{:.*}", p, v.abs()),
                         'e' => fmt_exp(v.abs(), p, false),
@@ -884,14 +888,18 @@ impl Shell {
                     for p in &mut j.procs {
                         p.stopped = false;
                     }
-                    let _ = sys::kill(-j.pgid, sys::SIGCONT as i32);
+                    if j.pgid > 0 {
+                        let _ = sys::kill(-j.pgid, sys::SIGCONT as i32);
+                    }
                     err!("[{}] {} &\n", j.id, j.text);
                     return Ok(0);
                 }
                 let j = self.jobs.remove(idx);
                 err!("{}\n", j.text);
-                let _ = sys::tcsetpgrp(self.tty, j.pgid);
-                let _ = sys::kill(-j.pgid, sys::SIGCONT as i32);
+                if j.pgid > 0 {
+                    let _ = sys::tcsetpgrp(self.tty, j.pgid);
+                    let _ = sys::kill(-j.pgid, sys::SIGCONT as i32);
+                }
                 let pids: Vec<i32> = j.procs.iter().filter(|p| p.status.is_none()).map(|p| p.pid).collect();
                 let sts = self.wait_job(j.pgid, pids, &j.text)?;
                 Ok(sts.last().copied().unwrap_or(0))
@@ -1385,7 +1393,7 @@ impl Shell {
                     self.z_add(&newpwd);
                     self.save_last_dir();
                     if self.find_command("zoxide").is_some() {
-                        let _ = std::process::Command::new("zoxide").arg("add").arg(&newpwd).status();
+                        let _ = std::process::Command::new("zoxide").args(["add", "--"]).arg(&newpwd).status();
                     }
                 }
                 if let Some(f) = self.funcs.get("chpwd").cloned() {
@@ -1916,7 +1924,7 @@ impl Shell {
             return finish(self, optind);
         }
         let cur: Vec<char> = params[optind - 1].chars().collect();
-        if self.getopts_off == 0 {
+        if self.getopts_off == 0 || self.getopts_off >= cur.len() {
             if cur.len() < 2 || cur[0] != '-' {
                 return finish(self, optind);
             }
@@ -2116,7 +2124,7 @@ impl Shell {
                 match self.find_job(Some(a)) {
                     Some(j) => {
                         let job = &self.jobs[j];
-                        if job.pgid != 0 {
+                        if job.pgid > 0 {
                             -job.pgid
                         } else {
                             job.procs[0].pid
@@ -2227,16 +2235,14 @@ impl Shell {
         }
         let path = format!("{}/z", self.data_dir());
         let body: String = v.iter().map(|(p, s, l)| format!("{:.2}\t{}\t{}\n", s, l, p)).collect();
-        let tmp = format!("{}.{}", path, sys::getpid());
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let _ = sys::write_atomic_private(&path, body.as_bytes());
     }
 
     /// Remember the current directory so the next session can start there.
     pub fn save_last_dir(&mut self) {
         let cwd = self.cwd();
-        let _ = std::fs::write(format!("{}/last_dir", self.data_dir()), format!("{}\n", cwd));
+        let path = format!("{}/last_dir", self.data_dir());
+        let _ = sys::write_atomic_private(&path, format!("{}\n", cwd).as_bytes());
     }
 
     pub fn z_add(&mut self, dir: &str) {
@@ -2611,11 +2617,14 @@ impl Shell {
                 let mut max: Option<usize> = None;
                 let mut i = 1;
                 while i < args.len() && args[i].starts_with('-') {
+                    if args[i] == "--" {
+                        i += 1;
+                        break;
+                    }
                     if args[i] == "-n" || args[i] == "--max" {
                         i += 1;
                         max = args.get(i).and_then(|s| s.parse().ok());
                     }
-                    if args[i] == "--" { i += 1; break; }
                     i += 1;
                 }
                 if i >= args.len() {
@@ -2636,9 +2645,10 @@ impl Shell {
                         s.split(sep).map(|x| x.to_string()).collect()
                     };
                     let parts = if let Some(m) = max {
-                        // join tail
-                        if parts.len() > m {
-                            let mut v: Vec<String> = parts[..m - 1].iter().map(|x| x.to_string()).collect();
+                        if m == 0 {
+                            Vec::new()
+                        } else if parts.len() > m {
+                            let mut v: Vec<String> = parts[..m - 1].to_vec();
                             v.push(parts[m - 1..].join(sep));
                             v
                         } else {
@@ -2655,7 +2665,7 @@ impl Shell {
             }
             "join" => {
                 let sep = args.get(1).cloned().unwrap_or_default();
-                let rest = &args[2..];
+                let rest = &args[2.min(args.len())..];
                 let inputs = if rest.is_empty() && !sys::isatty(0) {
                     String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
                 } else {
@@ -2669,6 +2679,10 @@ impl Shell {
                 let mut length: Option<usize> = None;
                 let mut i = 1;
                 while i < args.len() && args[i].starts_with('-') {
+                    if args[i] == "--" {
+                        i += 1;
+                        break;
+                    }
                     if args[i] == "-s" || args[i] == "--start" {
                         i += 1;
                         start = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -2676,10 +2690,9 @@ impl Shell {
                         i += 1;
                         length = args.get(i).and_then(|s| s.parse().ok());
                     }
-                    if args[i] == "--" { i += 1; break; }
                     i += 1;
                 }
-                let rest = &args[i..];
+                let rest = &args[i.min(args.len())..];
                 let inputs = if rest.is_empty() && !sys::isatty(0) {
                     String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
                 } else {
@@ -2688,10 +2701,14 @@ impl Shell {
                 for s in inputs {
                     let chars: Vec<char> = s.chars().collect();
                     let n = chars.len() as isize;
-                    let mut st = if start < 0 { (n + start).max(0) as usize } else { (start - 1).max(0) as usize };
+                    let mut st = if start < 0 {
+                        n.saturating_add(start).max(0) as usize
+                    } else {
+                        start.saturating_sub(1).max(0) as usize
+                    };
                     if st > chars.len() { st = chars.len(); }
                     let end = match length {
-                        Some(l) => (st + l).min(chars.len()),
+                        Some(l) => st.saturating_add(l).min(chars.len()),
                         None => chars.len(),
                     };
                     let outstr: String = chars[st..end].iter().collect();
@@ -2701,7 +2718,7 @@ impl Shell {
             }
             "match" => {
                 let pat = args.get(1).cloned().unwrap_or_default();
-                let rest = &args[2..];
+                let rest = &args[2.min(args.len())..];
                 let inputs = if rest.is_empty() && !sys::isatty(0) {
                     String::from_utf8_lossy(&sys::read_all(0)).lines().map(|s| s.to_string()).collect()
                 } else {

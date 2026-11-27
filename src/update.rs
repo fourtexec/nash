@@ -10,7 +10,8 @@
 //!
 //! `nash update PATH` installs a binary the user already has instead.
 
-use std::io::Read;
+use crate::sys;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -46,7 +47,23 @@ only runs the checks (exit status 0: PATH can be installed, 1: it cannot).
 ";
 
 fn has(cmd: &str) -> bool {
-    Command::new("sh").args(["-c", &format!("command -v {} >/dev/null 2>&1", cmd)]).status().map(|s| s.success()).unwrap_or(false)
+    sys::find_in_path(cmd).is_some()
+}
+
+/// Ensure a remote update URL uses HTTPS and contains no whitespace or control
+/// characters that could cause header/argument injection.
+fn validate_https_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("refusing non-HTTPS URL: {}", url))?;
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() || host.starts_with('.') {
+        return Err(format!("invalid URL host: {}", url));
+    }
+    if url.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(format!("invalid characters in URL: {}", url));
+    }
+    Ok(())
 }
 
 /// The file of a release built for the platform this binary was compiled for.
@@ -294,7 +311,7 @@ fn checksum_in(sums: &str, asset: &str) -> Option<String> {
         let mut it = l.split_whitespace();
         let hash = it.next()?;
         let name = it.next()?.trim_start_matches('*');
-        (name == asset && hash.len() == 64).then(|| hash.to_lowercase())
+        (name == asset && hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit())).then(|| hash.to_lowercase())
     })
 }
 
@@ -344,16 +361,17 @@ impl Fetcher {
         let mut c;
         if self.curl {
             c = Command::new("curl");
-            c.args(["-fsSL", "--retry", "2", "-o", dest, url]);
+            c.args(["-fsSL", "--proto", "=https", "--tlsv1.2", "--retry", "2", "-o", dest, "--", url]);
         } else {
             c = Command::new("wget");
-            c.args(["-q", "-O", dest, url]);
+            c.args(["-q", "-O", dest, "--", url]);
         }
         c
     }
 
     /// Fetch a small text file.
     fn text(&self, url: &str) -> Result<String, String> {
+        validate_https_url(url)?;
         let out = self.command(url, "-").stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -363,6 +381,7 @@ impl Fetcher {
     }
 
     fn file(&self, url: &str, dest: &str) -> Result<(), String> {
+        validate_https_url(url)?;
         let out = self.command(url, dest).stdin(Stdio::null()).stdout(Stdio::null()).output().map_err(|e| e.to_string())?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -372,19 +391,142 @@ impl Fetcher {
     }
 }
 
-/// SHA-256 of a file, by whichever tool the system has. None: no tool.
-fn sha256(path: &str) -> Option<String> {
-    for (cmd, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
-        if let Ok(out) = Command::new(cmd).args(args).arg(path).stderr(Stdio::null()).output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout);
-                if let Some(h) = s.split_whitespace().next() {
-                    return Some(h.to_lowercase());
-                }
-            }
+/// Pure-Rust streaming SHA-256 (FIPS 180-4) so checksum verification is always
+/// enforced without depending on external hashing binaries.
+struct Sha256 {
+    state: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Sha256 {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
         }
     }
-    None
+
+    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(Self::K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..64].copy_from_slice(&data[..need]);
+            let block = self.buf;
+            Self::compress(&mut self.state, &block);
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+        while data.len() >= 64 {
+            let block: &[u8; 64] = data[..64].try_into().unwrap();
+            Self::compress(&mut self.state, block);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    fn finalize_hex(mut self) -> String {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            let block = self.buf;
+            Self::compress(&mut self.state, &block);
+            self.buf_len = 0;
+        }
+        self.buf[self.buf_len..56].fill(0);
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buf;
+        Self::compress(&mut self.state, &block);
+        let mut out = String::with_capacity(64);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for word in self.state {
+            for b in word.to_be_bytes() {
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+        out
+    }
+}
+
+/// SHA-256 of a file, computed in pure Rust so verification never fails open.
+fn sha256(path: &str) -> Result<String, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("cannot read {} for checksum: {}", path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("cannot read {} for checksum: {}", path, e)),
+        }
+    }
+    Ok(hasher.finalize_hex())
 }
 
 /// What kind of file a header belongs to: (operating system, CPU), in the
@@ -507,33 +649,43 @@ fn install_file(path: &str, check: bool) -> i32 {
     }
     let dest = dest.to_string_lossy().into_owned();
 
-    // 2. copy it next to the target (so the final rename is atomic) and make
+    // 2. copy into an exclusively-created temp file with an unpredictable name
+    //    (next to the target for install, or in TMPDIR for --check) and make
     //    sure the copy really runs here as nash
-    let tmp = if check {
-        // --check must work without write access to the install directory
+    let (tmp_dir, tmp_prefix, tmp_mode) = if check {
         let dir = std::env::var("TMPDIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "/tmp".to_string());
-        format!("{}/nash-update-check{}", dir.trim_end_matches('/'), std::process::id())
+        (dir, ".nash-update-check-", 0o700u32)
     } else {
-        format!("{}.new{}", dest, std::process::id())
+        let dir = Path::new(&dest).parent().and_then(|p| p.to_str()).filter(|s| !s.is_empty()).unwrap_or(".").to_string();
+        (dir, ".nash-update-", 0o755u32)
+    };
+    let (tmp, mut dst_file) = match sys::create_temp_file(&tmp_dir, tmp_prefix, tmp_mode) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if check {
+                err!("nash update: cannot create temp file in {}: {}\n", tmp_dir, e);
+            } else {
+                err!("nash update: cannot write to {}: {}\n", dest, e);
+                if e.kind() == std::io::ErrorKind::PermissionDenied && sys::geteuid() != 0 {
+                    err!("try: sudo {} update {}\n", dest, path);
+                }
+            }
+            return 1;
+        }
     };
     let fail = |msg: String| -> i32 {
         let _ = std::fs::remove_file(&tmp);
         err!("nash update: {}\n", msg);
         1
     };
-    if let Err(e) = std::fs::copy(src, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        if check {
-            err!("nash update: cannot copy {} to {}: {}\n", path, tmp, e);
-        } else {
-            err!("nash update: cannot write to {}: {}\n", dest, e);
-            if e.kind() == std::io::ErrorKind::PermissionDenied && unsafe { libc::geteuid() } != 0 {
-                err!("try: sudo {} update {}\n", dest, path);
-            }
-        }
-        return 1;
+    let copy_res = std::fs::File::open(src)
+        .and_then(|mut src_file| std::io::copy(&mut src_file, &mut dst_file))
+        .and_then(|_| dst_file.flush());
+    drop(dst_file);
+    if let Err(e) = copy_res {
+        return fail(format!("cannot copy {} to {}: {}", path, tmp, e));
     }
-    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(tmp_mode)) {
         return fail(format!("cannot make {} executable: {}", tmp, e));
     }
     let version = match nash_version(&tmp) {
@@ -582,6 +734,10 @@ pub fn update(args: &[String]) -> i32 {
     let current = crate::version();
     let url = std::env::var("NASH_UPDATE_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| DEFAULT_URL.to_string());
     let url = url.trim_end_matches('/');
+    if let Err(e) = validate_https_url(url) {
+        err!("nash update: {}\n", e);
+        return 2;
+    }
     let asset = match asset_name() {
         Some(a) => a,
         None => {
@@ -685,20 +841,25 @@ pub fn update(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let tmp = format!("{}.new{}", dest, std::process::id());
+    let dest_dir = Path::new(&dest).parent().and_then(|p| p.to_str()).filter(|s| !s.is_empty()).unwrap_or(".");
+    let tmp = match sys::create_temp_file(dest_dir, ".nash-update-", 0o600) {
+        Ok((path, file)) => {
+            drop(file);
+            path
+        }
+        Err(e) => {
+            err!("nash update: cannot write to {}: {}\n", dest, e);
+            if sys::geteuid() != 0 {
+                err!("try: sudo {} update\n", dest);
+            }
+            return 1;
+        }
+    };
     let fail = |msg: String| -> i32 {
         let _ = std::fs::remove_file(&tmp);
         err!("nash update: {}\n", msg);
         1
     };
-    if let Err(e) = std::fs::File::create(&tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        err!("nash update: cannot write to {}: {}\n", dest, e);
-        if unsafe { libc::geteuid() } != 0 {
-            err!("try: sudo {} update\n", dest);
-        }
-        return 1;
-    }
     out!("downloading nash {} ({})\n", latest, asset);
     if let Err(e) = fetch.file(&build.url, &tmp) {
         return fail(format!("cannot download {}: {}", build.url, e));
@@ -717,9 +878,9 @@ pub fn update(args: &[String]) -> i32 {
         (None, None) => return fail(format!("release {} has no checksum for {}", latest, asset)),
     };
     match sha256(&tmp) {
-        Some(got) if got == want => {}
-        Some(got) => return fail(format!("checksum mismatch for {} (expected {}, got {})", asset, want, got)),
-        None => err!("nash update: warning: no sha256sum or shasum, checksum not verified\n"),
+        Ok(got) if got == want => {}
+        Ok(got) => return fail(format!("checksum mismatch for {} (expected {}, got {})", asset, want, got)),
+        Err(e) => return fail(e),
     }
     if let Err(e) = inspect(Path::new(&tmp)) {
         return fail(format!("the downloaded {} {}", asset, e));
@@ -730,7 +891,7 @@ pub fn update(args: &[String]) -> i32 {
     let reported = Command::new(&tmp).arg("--version").stdin(Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     match reported.as_deref() {
         Some(r) if r.starts_with("nash ") => {}
-        _ => return fail(format!("the downloaded binary does not run as nash on this system")),
+        _ => return fail("the downloaded binary does not run as nash on this system".to_string()),
     }
 
     // 4. swap it in; a nash that is running keeps its old file
@@ -874,5 +1035,39 @@ const RELEASES: &str = r#"[
         assert!(check_platform(family, "m68k").is_err());
         let other = if family == "linux" { "macos" } else { "linux" };
         assert!(check_platform(other, arch).is_err());
+    }
+
+    #[test]
+    fn sha256_vectors() {
+        let digest = |b: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(b);
+            h.finalize_hex()
+        };
+        assert_eq!(digest(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(digest(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // multi-chunk streaming test
+        let mut h = Sha256::new();
+        for _ in 0..1000 {
+            h.update(&[b'a'; 1000]);
+        }
+        assert_eq!(h.finalize_hex(), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    }
+
+    #[test]
+    fn https_url_validation() {
+        assert!(validate_https_url("https://api.github.com/repos/fourtexec/nash").is_ok());
+        assert!(validate_https_url("http://example.com/nash").is_err());
+        assert!(validate_https_url("file:///etc/passwd").is_err());
+        assert!(validate_https_url("-K/etc/passwd").is_err());
+        assert!(validate_https_url("https://example.com/a b").is_err());
+        assert!(validate_https_url("https:///no-host").is_err());
+        // checksum_in rejects non-hex 64-char strings
+        let bad_hex = format!("{}  nash-linux-x86_64\n", "z".repeat(64));
+        assert_eq!(checksum_in(&bad_hex, "nash-linux-x86_64"), None);
     }
 }

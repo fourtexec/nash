@@ -1,5 +1,10 @@
 //! Shell pattern matching (with extended globs) and pathname expansion.
 
+const MAX_EXTGLOB_DEPTH: u32 = 64;
+const MAX_GLOB_DEPTH: usize = 128;
+const MAX_GLOB_RESULTS: usize = 100_000;
+const MAX_MEMO_CELLS: usize = 4_000_000;
+
 #[derive(Clone)]
 enum Tok {
     Ch(char),
@@ -117,15 +122,20 @@ fn parse_set(p: &[char], start: usize) -> Option<(Tok, usize)> {
     }
 }
 
-fn compile(p: &[char]) -> Vec<Tok> {
-    let mut out = Vec::new();
+fn compile_depth(p: &[char], depth: u32) -> (Vec<Tok>, bool) {
+    let mut out = Vec::with_capacity(p.len());
+    let mut has_ext = false;
     let mut i = 0;
     while i < p.len() {
         let c = p[i];
-        if matches!(c, '?' | '*' | '+' | '@' | '!') && i + 1 < p.len() && p[i + 1] == '(' {
+        if depth < MAX_EXTGLOB_DEPTH && matches!(c, '?' | '*' | '+' | '@' | '!') && i + 1 < p.len() && p[i + 1] == '(' {
             if let Some(end) = find_close(p, i + 1) {
-                let alts = split_alts(&p[i + 2..end]).into_iter().map(compile).collect();
+                let alts = split_alts(&p[i + 2..end])
+                    .into_iter()
+                    .map(|a| compile_depth(a, depth + 1).0)
+                    .collect();
                 out.push(Tok::Ext(c, alts));
+                has_ext = true;
                 i = end + 1;
                 continue;
             }
@@ -154,84 +164,157 @@ fn compile(p: &[char]) -> Vec<Tok> {
         }
         i += 1;
     }
-    out
+    (out, has_ext)
 }
 
-fn m(mut t: &[Tok], mut s: &[char]) -> bool {
-    loop {
-        match t.first() {
-            None => return s.is_empty(),
-            Some(Tok::Ch(c)) => {
-                if s.first() != Some(c) {
-                    return false;
-                }
-            }
-            Some(Tok::Any) => {
-                if s.is_empty() {
-                    return false;
-                }
-            }
-            Some(Tok::Set(neg, ranges, classes)) => {
-                let c = match s.first() {
-                    Some(c) => *c,
-                    None => return false,
-                };
-                let hit = ranges.iter().any(|(a, b)| *a <= c && c <= *b) || classes.iter().any(|f| f(c));
-                if hit == *neg {
-                    return false;
-                }
-            }
-            Some(Tok::Star) => {
-                let rest = &t[1..];
-                if rest.is_empty() {
-                    return true;
-                }
-                if let Some(Tok::Ch(c)) = rest.first() {
-                    for k in 0..s.len() {
-                        if s[k] == *c && m(rest, &s[k..]) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-                for k in 0..=s.len() {
-                    if m(rest, &s[k..]) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            Some(Tok::Ext(kind, alts)) => {
-                let rest = &t[1..];
-                let any = |sub: &[char]| alts.iter().any(|a| m(a, sub));
-                return match kind {
-                    '@' => (0..=s.len()).any(|k| any(&s[..k]) && m(rest, &s[k..])),
-                    '?' => m(rest, s) || (0..=s.len()).any(|k| any(&s[..k]) && m(rest, &s[k..])),
-                    '*' => m(rest, s) || (1..=s.len()).any(|k| any(&s[..k]) && m(t, &s[k..])),
-                    '+' => (0..=s.len()).any(|k| any(&s[..k]) && (m(rest, &s[k..]) || (k > 0 && m(t, &s[k..])))),
-                    _ => (0..=s.len()).any(|k| !any(&s[..k]) && m(rest, &s[k..])),
-                };
-            }
+#[inline]
+fn match_one_tok(tok: &Tok, c: char) -> bool {
+    match tok {
+        Tok::Ch(ch) => *ch == c,
+        Tok::Any => true,
+        Tok::Set(neg, ranges, classes) => {
+            let hit = ranges.iter().any(|(a, b)| *a <= c && c <= *b) || classes.iter().any(|f| f(c));
+            hit != *neg
         }
-        t = &t[1..];
-        s = &s[1..];
+        _ => false,
     }
 }
 
-pub struct Pattern(Vec<Tok>);
+/// Iterative O(|t| * |s|) matcher for patterns without `Tok::Ext`.
+/// Backtracking only to the most recent `Tok::Star` is exact because all other
+/// tokens consume exactly one character.
+fn match_no_ext(t: &[Tok], s: &[char]) -> bool {
+    let (mut ti, mut si) = (0usize, 0usize);
+    let (mut star_t, mut star_s) = (None::<usize>, 0usize);
+    while si < s.len() {
+        if ti < t.len() {
+            match &t[ti] {
+                Tok::Star => {
+                    star_t = Some(ti);
+                    ti += 1;
+                    star_s = si;
+                    continue;
+                }
+                tok if match_one_tok(tok, s[si]) => {
+                    ti += 1;
+                    si += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let Some(st) = star_t {
+            ti = st + 1;
+            star_s += 1;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while ti < t.len() && matches!(t[ti], Tok::Star) {
+        ti += 1;
+    }
+    ti == t.len()
+}
+
+/// Memoized matcher for patterns that contain `Tok::Ext`.
+fn m_memo(t: &[Tok], s: &[char], ti: usize, si: usize, memo: &mut [u8]) -> bool {
+    let stride = s.len() + 1;
+    let idx = ti * stride + si;
+    if !memo.is_empty() {
+        let cached = memo[idx];
+        if cached != 0 {
+            return cached == 2;
+        }
+    }
+    let res = match t.get(ti) {
+        None => si == s.len(),
+        Some(Tok::Star) => {
+            if ti + 1 == t.len() {
+                true
+            } else {
+                // Star can consume 0 chars (advance ti) or 1+ chars (advance si)
+                m_memo(t, s, ti + 1, si, memo) || (si < s.len() && m_memo(t, s, ti, si + 1, memo))
+            }
+        }
+        Some(Tok::Ext(kind, alts)) => {
+            let rem = &s[si..];
+            let any = |sub: &[char]| alts.iter().any(|a| match_tokens(a, sub));
+            match kind {
+                '@' => (0..=rem.len()).any(|k| any(&rem[..k]) && m_memo(t, s, ti + 1, si + k, memo)),
+                '?' => m_memo(t, s, ti + 1, si, memo) || (0..=rem.len()).any(|k| any(&rem[..k]) && m_memo(t, s, ti + 1, si + k, memo)),
+                '*' => m_memo(t, s, ti + 1, si, memo) || (1..=rem.len()).any(|k| any(&rem[..k]) && m_memo(t, s, ti, si + k, memo)),
+                '+' => (0..=rem.len()).any(|k| any(&rem[..k]) && (m_memo(t, s, ti + 1, si + k, memo) || (k > 0 && m_memo(t, s, ti, si + k, memo)))),
+                _ => (0..=rem.len()).any(|k| !any(&rem[..k]) && m_memo(t, s, ti + 1, si + k, memo)),
+            }
+        }
+        Some(tok) => si < s.len() && match_one_tok(tok, s[si]) && m_memo(t, s, ti + 1, si + 1, memo),
+    };
+    if !memo.is_empty() {
+        memo[idx] = if res { 2 } else { 1 };
+    }
+    res
+}
+
+fn match_tokens_with_flag(t: &[Tok], has_ext: bool, s: &[char]) -> bool {
+    if !has_ext {
+        return match_no_ext(t, s);
+    }
+    let cells = (t.len() + 1).saturating_mul(s.len() + 1);
+    let mut memo = if cells <= MAX_MEMO_CELLS { vec![0u8; cells] } else { Vec::new() };
+    m_memo(t, s, 0, 0, &mut memo)
+}
+
+fn match_tokens(t: &[Tok], s: &[char]) -> bool {
+    let has_ext = t.iter().any(|tok| matches!(tok, Tok::Ext(_, _)));
+    match_tokens_with_flag(t, has_ext, s)
+}
+
+/// Zero-allocation iterative byte matcher for patterns with `*` and optionally `?`
+/// (when `allow_q` is true, caller guarantees both `p` and `s` are ASCII).
+fn match_simple_bytes(p: &[u8], s: &[u8], allow_q: bool) -> bool {
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_p, mut star_s) = (None::<usize>, 0usize);
+    while si < s.len() {
+        if pi < p.len() && ((allow_q && p[pi] == b'?') || (p[pi] != b'*' && p[pi] == s[si])) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_p = Some(pi);
+            pi += 1;
+            star_s = si;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_s += 1;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+pub struct Pattern {
+    toks: Vec<Tok>,
+    has_ext: bool,
+}
 
 impl Pattern {
     pub fn new(p: &str) -> Pattern {
         let cs: Vec<char> = p.chars().collect();
-        Pattern(compile(&cs))
+        let (toks, has_ext) = compile_depth(&cs, 0);
+        Pattern { toks, has_ext }
     }
     pub fn matches(&self, s: &str) -> bool {
         let cs: Vec<char> = s.chars().collect();
-        m(&self.0, &cs)
+        match_tokens_with_flag(&self.toks, self.has_ext, &cs)
     }
     fn literal(&self) -> Option<String> {
         let mut s = String::new();
-        for t in &self.0 {
+        for t in &self.toks {
             match t {
                 Tok::Ch(c) => s.push(*c),
                 _ => return None,
@@ -242,6 +325,32 @@ impl Pattern {
 }
 
 pub fn matches(pat: &str, s: &str) -> bool {
+    let pb = pat.as_bytes();
+    let mut has_complex = false;
+    let mut has_q = false;
+    let mut has_star = false;
+    for &b in pb {
+        match b {
+            b'\\' | b'[' | b'(' => {
+                has_complex = true;
+                break;
+            }
+            b'?' => has_q = true,
+            b'*' => has_star = true,
+            _ => {}
+        }
+    }
+    if !has_complex {
+        if !has_star && !has_q {
+            return pat == s;
+        }
+        if !has_q {
+            return match_simple_bytes(pb, s.as_bytes(), false);
+        }
+        if pat.is_ascii() && s.is_ascii() {
+            return match_simple_bytes(pb, s.as_bytes(), true);
+        }
+    }
     Pattern::new(pat).matches(s)
 }
 
@@ -250,14 +359,25 @@ pub fn trim(s: &str, pat: &str, prefix: bool, longest: bool) -> String {
     let p = Pattern::new(pat);
     let cs: Vec<char> = s.chars().collect();
     let n = cs.len();
-    let order: Vec<usize> = if longest { (0..=n).rev().collect() } else { (0..=n).collect() };
-    for k in order {
-        if prefix {
-            if m(&p.0, &cs[..k]) {
-                return cs[k..].iter().collect();
+    if longest {
+        for k in (0..=n).rev() {
+            if prefix {
+                if match_tokens_with_flag(&p.toks, p.has_ext, &cs[..k]) {
+                    return cs[k..].iter().collect();
+                }
+            } else if match_tokens_with_flag(&p.toks, p.has_ext, &cs[n - k..]) {
+                return cs[..n - k].iter().collect();
             }
-        } else if m(&p.0, &cs[n - k..]) {
-            return cs[..n - k].iter().collect();
+        }
+    } else {
+        for k in 0..=n {
+            if prefix {
+                if match_tokens_with_flag(&p.toks, p.has_ext, &cs[..k]) {
+                    return cs[k..].iter().collect();
+                }
+            } else if match_tokens_with_flag(&p.toks, p.has_ext, &cs[n - k..]) {
+                return cs[..n - k].iter().collect();
+            }
         }
     }
     s.to_string()
@@ -266,7 +386,7 @@ pub fn trim(s: &str, pat: &str, prefix: bool, longest: bool) -> String {
 /// `${var/pat/rep}`; mode: '/' first, 'a' all, '#' anchored at start, '%' anchored at end.
 pub fn replace(s: &str, pat: &str, rep: &str, mode: char) -> String {
     let p = Pattern::new(pat);
-    if p.0.is_empty() {
+    if p.toks.is_empty() {
         return match mode {
             '#' => format!("{}{}", rep, s),
             '%' => format!("{}{}", s, rep),
@@ -292,7 +412,7 @@ pub fn replace(s: &str, pat: &str, rep: &str, mode: char) -> String {
     match mode {
         '#' => {
             for k in (0..=n).rev() {
-                if m(&p.0, &cs[..k]) {
+                if match_tokens_with_flag(&p.toks, p.has_ext, &cs[..k]) {
                     return format!("{}{}", rep, cs[k..].iter().collect::<String>());
                 }
             }
@@ -300,14 +420,14 @@ pub fn replace(s: &str, pat: &str, rep: &str, mode: char) -> String {
         }
         '%' => {
             for k in 0..=n {
-                if m(&p.0, &cs[k..]) {
+                if match_tokens_with_flag(&p.toks, p.has_ext, &cs[k..]) {
                     return format!("{}{}", cs[..k].iter().collect::<String>(), rep);
                 }
             }
             s.to_string()
         }
         _ => {
-            let first_ch = match p.0.first() {
+            let first_ch = match p.toks.first() {
                 Some(Tok::Ch(c)) => Some(*c),
                 _ => None,
             };
@@ -318,7 +438,7 @@ pub fn replace(s: &str, pat: &str, rep: &str, mode: char) -> String {
                 let mut matched = None;
                 if !done && first_ch.map(|c| c == cs[i]).unwrap_or(true) {
                     for j in (i + 1..=n).rev() {
-                        if m(&p.0, &cs[i..j]) {
+                        if match_tokens_with_flag(&p.toks, p.has_ext, &cs[i..j]) {
                             matched = Some(j);
                             break;
                         }
@@ -345,13 +465,13 @@ pub fn replace(s: &str, pat: &str, rep: &str, mode: char) -> String {
 
 /// Does this pattern component contain active glob characters?
 pub fn has_magic(p: &str) -> bool {
-    let cs: Vec<char> = p.chars().collect();
+    let b = p.as_bytes();
     let mut i = 0;
-    while i < cs.len() {
-        match cs[i] {
-            '\\' => i += 1,
-            '*' | '?' | '[' => return true,
-            '+' | '@' | '!' if cs.get(i + 1) == Some(&'(') => return true,
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'*' | b'?' | b'[' => return true,
+            b'+' | b'@' | b'!' if b.get(i + 1) == Some(&b'(') => return true,
             _ => {}
         }
         i += 1;
@@ -360,7 +480,7 @@ pub fn has_magic(p: &str) -> bool {
 }
 
 fn unescape(p: &str) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(p.len());
     let mut it = p.chars();
     while let Some(c) = it.next() {
         if c == '\\' {
@@ -388,29 +508,41 @@ fn list_dir(dir: &str) -> Vec<(String, bool)> {
     v
 }
 
-fn walk(base: &str, comps: &[String], out: &mut Vec<String>, dotglob: bool) {
+fn walk(base: &str, comps: &[String], out: &mut Vec<String>, dotglob: bool, depth: usize) {
+    if depth >= MAX_GLOB_DEPTH || out.len() >= MAX_GLOB_RESULTS {
+        return;
+    }
     let comp = &comps[0];
     let rest = &comps[1..];
     if comp == "**" {
         if rest.is_empty() {
-            fn all(base: &str, out: &mut Vec<String>, dotglob: bool) {
+            fn all(base: &str, out: &mut Vec<String>, dotglob: bool, depth: usize) {
+                if depth >= MAX_GLOB_DEPTH || out.len() >= MAX_GLOB_RESULTS {
+                    return;
+                }
                 for (name, is_dir) in list_dir(base) {
+                    if out.len() >= MAX_GLOB_RESULTS {
+                        return;
+                    }
                     if name.starts_with('.') && !dotglob {
                         continue;
                     }
                     let path = format!("{}{}", base, name);
                     out.push(path.clone());
                     if is_dir {
-                        all(&format!("{}/", path), out, dotglob);
+                        all(&format!("{}/", path), out, dotglob, depth + 1);
                     }
                 }
             }
-            all(base, out, dotglob);
+            all(base, out, dotglob, depth);
         } else {
-            walk(base, rest, out, dotglob);
+            walk(base, rest, out, dotglob, depth + 1);
             for (name, is_dir) in list_dir(base) {
+                if out.len() >= MAX_GLOB_RESULTS {
+                    return;
+                }
                 if is_dir && (dotglob || !name.starts_with('.')) {
-                    walk(&format!("{}{}/", base, name), comps, out, dotglob);
+                    walk(&format!("{}{}/", base, name), comps, out, dotglob, depth + 1);
                 }
             }
         }
@@ -424,13 +556,16 @@ fn walk(base: &str, comps: &[String], out: &mut Vec<String>, dotglob: bool) {
                 out.push(path);
             }
         } else if comp.is_empty() || crate::sys::is_dir(&path) {
-            walk(&format!("{}/", path), rest, out, dotglob);
+            walk(&format!("{}/", path), rest, out, dotglob, depth + 1);
         }
         return;
     }
     let pat = Pattern::new(comp);
     let want_dot = comp.starts_with('.') || comp.starts_with("\\.");
     for (name, _) in list_dir(base) {
+        if out.len() >= MAX_GLOB_RESULTS {
+            return;
+        }
         if name.starts_with('.') && !want_dot && !dotglob {
             continue;
         }
@@ -441,7 +576,7 @@ fn walk(base: &str, comps: &[String], out: &mut Vec<String>, dotglob: bool) {
         if rest.is_empty() {
             out.push(path);
         } else if crate::sys::is_dir(&path) {
-            walk(&format!("{}/", path), rest, out, dotglob);
+            walk(&format!("{}/", path), rest, out, dotglob, depth + 1);
         }
     }
 }
@@ -487,8 +622,46 @@ pub fn glob(pat: &str, dotglob: bool) -> Vec<String> {
     if comps.len() == 1 && comps[0].is_empty() {
         return out;
     }
-    walk(&base, comps, &mut out, dotglob);
+    walk(&base, comps, &mut out, dotglob, 0);
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redos_resistance() {
+        // Pathological multi-star pattern (previously exponential).
+        let pat = "*a".repeat(25) + "*b";
+        let input = "a".repeat(60) + "c";
+        assert!(!matches(&pat, &input));
+
+        // Same via compiled Pattern with character class (non-ASCII-fast-path).
+        let pat_set = "*[a]".repeat(25) + "*b";
+        assert!(!Pattern::new(&pat_set).matches(&input));
+
+        // Pathological extglob repetition.
+        let ext_input = "a".repeat(35) + "c";
+        assert!(!matches("*(a|aa)b", &ext_input));
+    }
+
+    #[test]
+    fn extglob_and_depth_safety() {
+        assert!(matches("@(foo|bar)", "foo"));
+        assert!(matches("@(foo|bar)", "bar"));
+        assert!(!matches("@(foo|bar)", "baz"));
+        assert!(matches("+(ab)", "ababab"));
+        assert!(!matches("+(ab)", ""));
+        assert!(matches("?(a)b", "b"));
+        assert!(matches("?(a)b", "ab"));
+        assert!(matches("!(foo)", "bar"));
+        assert!(!matches("!(foo)", "foo"));
+
+        // Deeply nested extglob does not overflow stack.
+        let deep = "@(".repeat(100) + "a" + &")".repeat(100);
+        let _ = matches(&deep, "a");
+    }
 }

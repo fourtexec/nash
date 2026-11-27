@@ -3,12 +3,14 @@
 //! fall back to `libc`.
 
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use rustix::fd::{BorrowedFd, IntoRawFd};
-use rustix::fs::{Access, Mode, OFlags};
+use rustix::fs::Access;
 
 
 
@@ -62,7 +64,9 @@ pub fn last_error() -> String {
 
 /// Write `b` to `fd`, retrying on `EINTR`.
 pub fn write_fd(fd: i32, mut b: &[u8]) -> bool {
-    // Use rustix File for safe write (no unsafe in this function body).
+    if fd < 0 {
+        return false;
+    }
     let mut file = unsafe { File::from_raw_fd(fd) };
     let result = (|| -> std::io::Result<()> {
         while !b.is_empty() {
@@ -106,47 +110,45 @@ pub fn pipe() -> Option<(i32, i32)> {
 
 /// Close `fd`.
 pub fn close(fd: i32) {
-    // Use rustix File to close safely.
+    if fd < 0 {
+        return;
+    }
     let _file = unsafe { File::from_raw_fd(fd) };
     // File::drop closes the fd — that's what we want.
 }
 
 /// Duplicate `fd` to `b`.
 pub fn dup2(a: i32, b: i32) -> i32 {
-    // rustix doesn't expose dup2 directly in 0.38 stable API; use libc.
+    if a < 0 || b < 0 {
+        return -1;
+    }
     unsafe { libc::dup2(a, b) }
 }
 
 /// Duplicate `fd` to a descriptor >= `min_fd` with close-on-exec set.
 pub fn save_fd(fd: i32) -> i32 {
-    // fcntl_dupfd_cloexec may not exist in this rustix version; use libc.
+    if fd < 0 {
+        return -1;
+    }
     unsafe {
         libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10)
     }
 }
 
-/// Open `path` with `flags` and `mode`. Returns the fd or `-1`.
+/// Open `path` with `flags` and `mode`. Returns the fd or `-1` (and sets `errno`).
 pub fn open(path: &str, flags: i32, mode: u32) -> i32 {
     let c = match CString::new(path) {
         Ok(c) => c,
         Err(_) => return -1,
     };
-    let oflags = OFlags::from_bits_truncate(flags as u32);
-    let mode = {
-        #[cfg(target_os = "macos")]
-        let m = Mode::from_bits_truncate(mode as u16);
-        #[cfg(not(target_os = "macos"))]
-        let m = Mode::from_bits_truncate(mode as u32);
-        m
-    };
-    match rustix::fs::openat(rustix::fs::CWD, c.as_c_str(), oflags, mode) {
-        Ok(f) => f.into_raw_fd(),
-        Err(_) => -1,
-    }
+    unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) }
 }
 
 /// Return `true` if `fd` refers to a terminal.
 pub fn isatty(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
     unsafe {
         rustix::termios::isatty(BorrowedFd::borrow_raw(fd))
     }
@@ -154,6 +156,9 @@ pub fn isatty(fd: i32) -> bool {
 
 /// Read all bytes from `fd` until EOF or error.
 pub fn read_all(fd: i32) -> Vec<u8> {
+    if fd < 0 {
+        return Vec::new();
+    }
     let mut file = unsafe { File::from_raw_fd(fd) };
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
@@ -171,6 +176,9 @@ pub fn read_all(fd: i32) -> Vec<u8> {
 
 /// Read one byte from `fd`. `None` on EOF; `Err(errno)` on error (EINTR reported as Err).
 pub fn read_byte(fd: i32) -> Result<Option<u8>, i32> {
+    if fd < 0 {
+        return Err(libc::EBADF);
+    }
     let mut file = unsafe { File::from_raw_fd(fd) };
     let mut b = [0u8; 1];
     match file.read(&mut b) {
@@ -228,6 +236,89 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Generate a non-zero 64-bit random value from `/dev/urandom`, falling back
+/// to high-resolution time and process ID if `/dev/urandom` is unavailable.
+pub fn random_u64() -> u64 {
+    let mut buf = [0u8; 8];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            let v = u64::from_ne_bytes(buf);
+            if v != 0 {
+                return v;
+            }
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let pid = getpid() as u64;
+    let stack = (&buf as *const u8) as usize as u64;
+    let v = nanos.wrapping_mul(0x9E3779B97F4A7C15) ^ pid.rotate_left(17) ^ stack.rotate_left(31);
+    if v == 0 { 0x517CC1B727220A95 } else { v }
+}
+
+/// Locate an executable on `PATH` without spawning a shell.
+pub fn find_in_path(cmd: &str) -> Option<String> {
+    if cmd.is_empty() {
+        return None;
+    }
+    if cmd.contains('/') {
+        return is_executable(cmd).then(|| cmd.to_string());
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let full = if dir.is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{}/{}", dir.trim_end_matches('/'), cmd)
+        };
+        if is_executable(&full) {
+            return Some(full);
+        }
+    }
+    None
+}
+
+/// Exclusively create a new temporary file with an unpredictable name and
+/// explicit permissions (`O_CREAT | O_EXCL`), preventing symlink attacks.
+pub fn create_temp_file(dir: &str, prefix: &str, mode: u32) -> std::io::Result<(String, File)> {
+    let dir = dir.trim_end_matches('/');
+    let dir = if dir.is_empty() { "." } else { dir };
+    let pid = getpid();
+    for _ in 0..64 {
+        let rand = random_u64();
+        let path = format!("{}/{}{}-{:016x}", dir, prefix, pid, rand);
+        match OpenOptions::new().write(true).create_new(true).mode(mode).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "failed to create unique temporary file"))
+}
+
+/// Atomically write `data` to `path` via an exclusive `0o600` temporary file
+/// in the same directory.
+pub fn write_atomic_private(path: &str, data: &[u8]) -> std::io::Result<()> {
+    let p = Path::new(path);
+    let dir = p.parent().and_then(|d| d.to_str()).filter(|s| !s.is_empty()).unwrap_or(".");
+    let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    let prefix = format!(".{}.tmp-", base);
+    let (tmp_path, mut file) = create_temp_file(dir, &prefix, 0o600)?;
+    let res = file.write_all(data).and_then(|_| file.flush());
+    drop(file);
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub fn strftime(fmt: &str, t: i64) -> String {
     unsafe {
         #[allow(deprecated)]
@@ -256,7 +347,7 @@ pub fn home_of(user: &str) -> Option<String> {
     };
     unsafe {
         let pw = libc::getpwnam(c.as_ptr());
-        if pw.is_null() {
+        if pw.is_null() || (*pw).pw_dir.is_null() {
             return None;
         }
         Some(std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned())
@@ -272,14 +363,29 @@ pub fn current_user() -> (String, Option<String>) {
                 None,
             );
         }
-        (
-            std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned(),
-            Some(
-                std::ffi::CStr::from_ptr((*pw).pw_dir)
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        )
+        let name = if (*pw).pw_name.is_null() {
+            std::env::var("USER").unwrap_or_else(|_| "user".into())
+        } else {
+            std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+        };
+        let dir = if (*pw).pw_dir.is_null() {
+            None
+        } else {
+            Some(std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned())
+        };
+        (name, dir)
+    }
+}
+
+/// Return the current user's configured login shell, or empty string if unknown.
+pub fn get_login_shell() -> String {
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_shell.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
+        }
     }
 }
 
@@ -436,7 +542,39 @@ pub fn default_signal(sig: i32) {
 }
 
 pub fn take_pending(sig: i32) -> bool {
+    if !(0..65).contains(&sig) {
+        return false;
+    }
     PENDING[sig as usize].swap(false, Ordering::SeqCst)
+}
+
+/// Race-free `noclobber` (`set -C`) open: creates exclusively with `O_EXCL` if
+/// absent; if it exists, opens without `O_TRUNC` and checks `fstat` to reject
+/// regular files without truncating them.
+pub fn open_noclobber(path: &str) -> Result<i32, String> {
+    let fd = open(path, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o666);
+    if fd >= 0 {
+        return Ok(fd);
+    }
+    let e = errno();
+    if e != libc::EEXIST {
+        return Err(strerror(e));
+    }
+    let fd = open(path, libc::O_WRONLY, 0);
+    if fd < 0 {
+        let e2 = errno();
+        if std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+            return Err("cannot overwrite existing file".to_string());
+        }
+        return Err(strerror(e2));
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::fstat(fd, &mut st) };
+    if r == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFREG {
+        close(fd);
+        return Err("cannot overwrite existing file".to_string());
+    }
+    Ok(fd)
 }
 
 /// Set the file mode creation mask.
@@ -452,13 +590,6 @@ pub fn kill(pid: i32, sig: i32) -> i32 {
 /// Set the foreground process group of the terminal.
 pub fn tcsetpgrp(fd: i32, pgid: i32) -> i32 {
     unsafe { libc::tcsetpgrp(fd, pgid) }
-}
-
-/// Wait for a child process to change state. Returns the pid, or None on error.
-pub fn waitpid(pid: i32, opts: i32) -> Option<i32> {
-    let mut st: libc::c_int = 0;
-    let r = unsafe { libc::waitpid(pid, &mut st, opts) };
-    if r < 0 { None } else { Some(r) }
 }
 
 /// Wait for a child process and return its exit status, or None on error.
@@ -508,7 +639,7 @@ pub fn setpgid(pid: i32, pgid: i32) -> i32 {
 /// Get resource limits.
 pub fn getrlimit(resource: libc::c_int) -> Option<libc::rlimit> {
     let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
-    match unsafe { libc::getrlimit(resource, &mut rl) } {
+    match unsafe { libc::getrlimit(resource as _, &mut rl) } {
         0 => Some(rl),
         _ => None,
     }
@@ -516,7 +647,7 @@ pub fn getrlimit(resource: libc::c_int) -> Option<libc::rlimit> {
 
 /// Set resource limits.
 pub fn setrlimit(resource: libc::c_int, rl: &libc::rlimit) -> i32 {
-    unsafe { libc::setrlimit(resource, rl) }
+    unsafe { libc::setrlimit(resource as _, rl) }
 }
 
 /// Get terminal attributes.

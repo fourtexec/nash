@@ -275,7 +275,7 @@ impl Shell {
             cur_text: String::new(),
             path_cmds: None,
             self_exe: std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "nash".into()),
-            rng: (pid as u64) ^ (sys::now_secs() as u64).wrapping_mul(0x9E3779B97F4A7C15),
+            rng: sys::random_u64(),
             in_trap: false,
             term_modes: None,
             getopts_off: 0,
@@ -322,7 +322,7 @@ impl Shell {
         let lvl = sh.get("SHLVL").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) + 1;
         let _ = sh.set_str("SHLVL", lvl.to_string());
         sh.export_var("SHLVL");
-        let _ = sh.set_str("PPID", unsafe { libc::getppid() }.to_string());
+        let _ = sh.set_str("PPID", sys::getppid().to_string());
         let _ = sh.set_str("NASH_VERSION", crate::version());
         let _ = sh.set_str("OPTIND", "1");
         if sh.get("PS2").is_none() {
@@ -351,11 +351,28 @@ impl Shell {
         (0..self.scopes.len()).rev().find(|&i| self.scopes[i].contains_key(name))
     }
 
-    fn next_random(&mut self) -> u64 {
+    pub fn next_random(&mut self) -> u64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         self.rng
+    }
+
+    /// Borrow a scalar variable without allocating when it is not a dynamic special variable.
+    pub fn get_cow(&mut self, name: &str) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match name {
+            "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "FUNCNAME" | "USER" => {
+                return self.get(name).map(Cow::Owned);
+            }
+            _ => {}
+        }
+        match &self.var(name)?.val {
+            Val::Str(s) => Some(Cow::Borrowed(s.as_str())),
+            Val::Arr(a) => a.first().map(|s| Cow::Borrowed(s.as_str())),
+            Val::Map(m) => m.iter().find(|(k, _)| k == "0").map(|(_, v)| Cow::Borrowed(v.as_str())),
+            Val::Unset => None,
+        }
     }
 
     /// Scalar value of a variable (first element for arrays).
@@ -418,6 +435,36 @@ impl Shell {
 
     pub fn set_str(&mut self, name: &str, val: impl Into<String>) -> Result<(), String> {
         self.set(name, Val::Str(val.into()))
+    }
+
+    /// Fast integer assignment that reuses the existing string buffer in place when possible.
+    pub fn set_i64(&mut self, name: &str, val: i64) -> Result<(), String> {
+        use std::fmt::Write;
+        let idx = self.scope_of(name).unwrap_or(0);
+        let allexport = self.opts.allexport;
+        if let Some(v) = self.scopes[idx].get_mut(name) {
+            if v.readonly {
+                return Err(format!("{}: readonly variable", name));
+            }
+            if let Val::Str(ref mut s) = v.val {
+                s.clear();
+                let _ = write!(s, "{}", val);
+            } else {
+                v.val = Val::Str(val.to_string());
+            }
+            if allexport {
+                v.exported = true;
+            }
+        } else {
+            self.scopes[idx].insert(name.to_string(), Var { val: Val::Str(val.to_string()), exported: allexport, readonly: false });
+        }
+        if name == "PATH" {
+            self.hash.clear();
+        }
+        if is_locale_var(name) {
+            self.prompt_utf8 = None;
+        }
+        Ok(())
     }
 
     /// Create (or overwrite) a variable in the innermost scope.
@@ -497,6 +544,15 @@ impl Shell {
 
     pub fn ifs(&mut self) -> String {
         self.get("IFS").unwrap_or_else(|| " \t\n".to_string())
+    }
+
+    pub fn ifs_str(&self) -> &str {
+        match self.var("IFS").map(|v| &v.val) {
+            Some(Val::Str(s)) => s.as_str(),
+            Some(Val::Arr(a)) => a.first().map(|s| s.as_str()).unwrap_or(" \t\n"),
+            Some(Val::Map(m)) => m.iter().find(|(k, _)| k == "0").map(|(_, v)| v.as_str()).unwrap_or(" \t\n"),
+            _ => " \t\n",
+        }
     }
 
     pub fn home(&mut self) -> String {

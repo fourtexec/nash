@@ -2,8 +2,9 @@
 //! make it the user's login shell.
 
 use crate::sys;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const HELP: &str = "\
 usage: nash install [--prefix DIR] [--no-chsh]
@@ -27,7 +28,34 @@ fn run(cmd: &str, args: &[&str]) -> bool {
 }
 
 fn has(cmd: &str) -> bool {
-    Command::new("sh").args(["-c", &format!("command -v {} >/dev/null 2>&1", cmd)]).status().map(|s| s.success()).unwrap_or(false)
+    sys::find_in_path(cmd).is_some()
+}
+
+/// Reject control characters or newlines in a shell path before writing to
+/// `/etc/shells` or passing to `chsh`.
+fn is_safe_shell_path(path: &str) -> bool {
+    !path.is_empty() && !path.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// Append `line` to `/etc/shells` via `sudo tee -a /etc/shells` without
+/// invoking a subshell or interpolating the path into a shell command.
+fn append_etc_shells_sudo(line: &str) -> bool {
+    let mut child = match Command::new("sudo")
+        .args(["tee", "-a", "/etc/shells"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(line.as_bytes()).is_err() {
+            let _ = child.wait();
+            return false;
+        }
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 pub fn install(args: &[String]) -> i32 {
@@ -60,7 +88,7 @@ pub fn install(args: &[String]) -> i32 {
     }
     let (user, home) = sys::current_user();
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty()).or(home).unwrap_or_else(|| "/".into());
-    let root = unsafe { libc::geteuid() } == 0;
+    let root = sys::geteuid() == 0;
 
     // 1. the binary
     let bindir = match prefix {
@@ -69,6 +97,10 @@ pub fn install(args: &[String]) -> i32 {
         None => format!("{}/.local/bin", home),
     };
     let dest = format!("{}/nash", bindir);
+    if !is_safe_shell_path(&dest) {
+        err!("nash install: install path contains invalid control characters\n");
+        return 2;
+    }
     let src = match std::env::current_exe().and_then(|p| p.canonicalize()) {
         Ok(p) => p,
         Err(e) => {
@@ -81,11 +113,24 @@ pub fn install(args: &[String]) -> i32 {
         return 1;
     }
     {
-        // copy next to the target and rename, so a running nash is never truncated
-        let tmp = format!("{}.new{}", dest, std::process::id());
-        let r = std::fs::copy(&src, &tmp).and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))).and_then(|_| std::fs::rename(&tmp, &dest));
-        if let Err(e) = r {
-            let _ = std::fs::remove_file(&tmp);
+        // copy into an exclusively-created temp file next to the target and rename,
+        // so a running nash is never truncated and symlinks cannot be abused
+        let copy_res = (|| -> std::io::Result<()> {
+            let (tmp, mut dst_file) = sys::create_temp_file(&bindir, ".nash-install-", 0o755)?;
+            let r = std::fs::File::open(&src)
+                .and_then(|mut src_file| std::io::copy(&mut src_file, &mut dst_file))
+                .and_then(|_| dst_file.flush())
+                .and_then(|_| {
+                    drop(dst_file);
+                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                })
+                .and_then(|_| std::fs::rename(&tmp, &dest));
+            if r.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            r
+        })();
+        if let Err(e) = copy_res {
             err!("nash install: cannot install to {}: {}\n", dest, e);
             if !root {
                 err!("try: sudo {} install\n", src.display());
@@ -106,30 +151,24 @@ pub fn install(args: &[String]) -> i32 {
     let shells = std::fs::read_to_string("/etc/shells").unwrap_or_default();
     if !shells.lines().any(|l| l.trim() == dest) {
         let line = format!("{}{}\n", if shells.is_empty() || shells.ends_with('\n') { "" } else { "\n" }, dest);
-        let appended = std::fs::OpenOptions::new().append(true).create(true).open("/etc/shells").and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes())).is_ok();
+        let appended = std::fs::OpenOptions::new().append(true).create(true).open("/etc/shells").and_then(|mut f| f.write_all(line.as_bytes())).is_ok();
         if appended {
             out!("added {} to /etc/shells\n", dest);
         } else if sys::isatty(0) && has("sudo") {
             out!("adding {} to /etc/shells (needs sudo)\n", dest);
-            if !run("sudo", &["sh", "-c", &format!("echo '{}' >> /etc/shells", dest)]) {
+            if !append_etc_shells_sudo(&line) {
                 err!("nash install: could not update /etc/shells\n");
                 return 1;
             }
         } else {
-            err!("nash install: /etc/shells is not writable. Run as root:\n    echo '{}' >> /etc/shells\nthen:\n    chsh -s {}\n", dest, dest);
+            let quoted = crate::expand::shell_quote(&dest);
+            err!("nash install: /etc/shells is not writable. Run as root:\n    printf '%s\\n' {} >> /etc/shells\nthen:\n    chsh -s {}\n", quoted, quoted);
             return 1;
         }
     }
 
     // 3. login shell
-    let current = unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
-        }
-    };
+    let current = sys::get_login_shell();
     let ok = if has("chsh") {
         if root {
             run("chsh", &["-s", &dest, &user])
@@ -143,7 +182,7 @@ pub fn install(args: &[String]) -> i32 {
         false
     };
     if !ok {
-        err!("nash install: could not change the login shell. Do it by hand:\n    chsh -s {}\n", dest);
+        err!("nash install: could not change the login shell. Do it by hand:\n    chsh -s {}\n", crate::expand::shell_quote(&dest));
         return 1;
     }
     out!("nash is now the login shell for {} (was {})\nopen a new terminal or log in again to use it\nto go back: chsh -s {}\n", user, if current.is_empty() { "unknown" } else { &current }, if current.is_empty() { "/bin/sh" } else { &current });
@@ -197,17 +236,24 @@ pub fn uninstall(_args: &[String]) -> i32 {
     }
 
     // If nash is the login shell, tell the user how to switch back.
-    let current = unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
-        }
-    };
+    let current = sys::get_login_shell();
     if current.ends_with("/nash") {
         out!("nash was your login shell. Switch back with:\n    chsh -s /bin/sh\n(or another shell of your choice)\n");
     }
     out!("nash uninstalled. Open a new terminal to apply PATH changes.\n");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_path_validation() {
+        assert!(is_safe_shell_path("/usr/local/bin/nash"));
+        assert!(!is_safe_shell_path(""));
+        assert!(!is_safe_shell_path("/tmp/foo\n/bin/sh"));
+        assert!(!is_safe_shell_path("/tmp/foo\0bar"));
+        assert!(!is_safe_shell_path("/tmp/foo\rbar"));
+    }
 }

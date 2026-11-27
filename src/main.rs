@@ -79,11 +79,9 @@ fn finish(sh: &mut Shell, r: R) -> ! {
     }
     if sh.interactive {
         for j in &sh.jobs {
-            if j.pgid != 0 && !j.done() {
-                unsafe {
-                    libc::kill(-j.pgid, libc::SIGHUP);
-                    libc::kill(-j.pgid, libc::SIGCONT);
-                }
+            if j.pgid > 0 && !j.done() {
+                sys::kill(-j.pgid, libc::SIGHUP);
+                sys::kill(-j.pgid, libc::SIGCONT);
             }
         }
     }

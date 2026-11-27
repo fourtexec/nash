@@ -1,12 +1,15 @@
 //! Recursive-descent parser for the nash language (POSIX sh + bash/zsh/nash extensions).
 //!
-//! The parser works directly on characters and parses one complete command at a
-//! time, so aliases defined by one command affect the parsing of the next one.
+//! The parser works directly on UTF-8 slices and parses one complete command at
+//! a time, so aliases defined by one command affect the parsing of the next one.
 
 use crate::ast::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+const MAX_PARSE_DEPTH: u32 = 96;
+const MAX_ALIAS_EXPANSIONS: usize = 256;
 
 #[derive(Debug)]
 pub struct ParseError {
@@ -25,7 +28,7 @@ struct PendingHere {
 }
 
 pub struct Parser {
-    src: Vec<char>,
+    src: String,
     pos: usize,
     pub aliases: Rc<HashMap<String, String>>,
     pub interactive: bool,
@@ -34,6 +37,7 @@ pub struct Parser {
     extra_stop: Option<char>,
     regex_mode: bool,
     line_cache: (usize, usize),
+    depth: u32,
 }
 
 const CLOSERS: &[&str] = &["then", "else", "elif", "fi", "do", "done", "esac", "}"];
@@ -43,23 +47,26 @@ pub const RESERVED: &[&str] = &[
 ];
 const DECL: &[&str] = &["declare", "typeset", "local", "export", "readonly"];
 
-fn is_meta(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')')
+#[inline]
+fn is_meta_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')')
 }
 
 pub fn is_name(s: &str) -> bool {
-    let mut it = s.chars();
-    match it.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
+    let b = s.as_bytes();
+    let Some(&first) = b.first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
     }
-    it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    b[1..].iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 impl Parser {
     pub fn new(src: &str) -> Parser {
         Parser {
-            src: src.chars().collect(),
+            src: src.to_string(),
             pos: 0,
             aliases: Rc::new(HashMap::new()),
             interactive: false,
@@ -68,48 +75,74 @@ impl Parser {
             extra_stop: None,
             regex_mode: false,
             line_cache: (0, 1),
+            depth: 0,
         }
     }
 
     // ---------- low level helpers ----------
 
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        self.src.as_bytes()
+    }
+    #[inline]
+    fn peek_byte(&self) -> Option<u8> {
+        self.bytes().get(self.pos).copied()
+    }
+    #[inline]
+    fn peek_byte_at(&self, n: usize) -> Option<u8> {
+        self.bytes().get(self.pos + n).copied()
+    }
+    #[inline]
     fn peek(&self) -> Option<char> {
-        self.src.get(self.pos).copied()
+        self.src[self.pos..].chars().next()
     }
-    fn peek_at(&self, n: usize) -> Option<char> {
-        self.src.get(self.pos + n).copied()
-    }
+    #[inline]
     fn starts(&self, s: &str) -> bool {
-        let mut i = self.pos;
-        for c in s.chars() {
-            if self.src.get(i) != Some(&c) {
-                return false;
-            }
-            i += 1;
-        }
-        true
+        self.bytes()[self.pos..].starts_with(s.as_bytes())
     }
+    #[inline]
     fn eat(&mut self, s: &str) -> bool {
         if self.starts(s) {
-            self.pos += s.chars().count();
+            self.pos += s.len();
             true
         } else {
             false
         }
     }
+    #[inline]
     fn at_end(&self) -> bool {
         self.pos >= self.src.len()
     }
+    #[inline]
     fn text(&self, a: usize, b: usize) -> String {
-        self.src[a..b.min(self.src.len())].iter().collect()
+        self.src[a..b.min(self.src.len())].to_string()
+    }
+
+    #[inline]
+    fn enter(&mut self) -> PR<()> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(ParseError {
+                msg: "maximum nesting depth exceeded".to_string(),
+                incomplete: false,
+                line: self.line(),
+            });
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn leave(&mut self) {
+        self.depth -= 1;
     }
 
     pub fn line(&mut self) -> usize {
         let (p, l) = self.line_cache;
         let pos = self.pos.min(self.src.len());
         let (from, mut line) = if pos >= p { (p, l) } else { (0, 1) };
-        for c in &self.src[from..pos] {
-            if *c == '\n' {
+        for &b in &self.bytes()[from..pos] {
+            if b == b'\n' {
                 line += 1;
             }
         }
@@ -126,7 +159,7 @@ impl Parser {
         if self.at_end() {
             return self.err("unexpected end of input");
         }
-        let mut t = self.peek_token();
+        let mut t = self.peek_token().to_string();
         if t.is_empty() {
             let c = self.peek().unwrap();
             t = if c == '\n' { "newline".to_string() } else { c.to_string() };
@@ -139,21 +172,23 @@ impl Parser {
 
     /// Skip blanks, line continuations and comments.
     fn skip_ws(&mut self) {
-        loop {
-            match self.peek() {
-                Some(' ') | Some('\t') => self.pos += 1,
-                Some('\\') if self.peek_at(1) == Some('\n') => self.pos += 2,
-                Some('#') => {
-                    while let Some(c) = self.peek() {
-                        if c == '\n' {
-                            break;
-                        }
-                        self.pos += 1;
+        let b = self.src.as_bytes();
+        let len = b.len();
+        let mut p = self.pos;
+        while p < len {
+            match b[p] {
+                b' ' | b'\t' => p += 1,
+                b'\\' if p + 1 < len && b[p + 1] == b'\n' => p += 2,
+                b'#' => {
+                    while p < len && b[p] != b'\n' {
+                        p += 1;
                     }
+                    break;
                 }
                 _ => break,
             }
         }
+        self.pos = p;
     }
 
     fn consume_newline(&mut self) -> PR<()> {
@@ -164,7 +199,7 @@ impl Parser {
     fn skip_newlines(&mut self) -> PR<()> {
         loop {
             self.skip_ws();
-            if self.peek() == Some('\n') {
+            if self.peek_byte() == Some(b'\n') {
                 self.consume_newline()?;
             } else {
                 return Ok(());
@@ -184,14 +219,12 @@ impl Parser {
                     break;
                 }
                 let start = self.pos;
-                while let Some(c) = self.peek() {
-                    if c == '\n' {
-                        break;
-                    }
+                let bytes = self.src.as_bytes();
+                while self.pos < bytes.len() && bytes[self.pos] != b'\n' {
                     self.pos += 1;
                 }
                 let mut line = self.text(start, self.pos);
-                let had_nl = self.peek() == Some('\n');
+                let had_nl = self.peek_byte() == Some(b'\n');
                 if had_nl {
                     self.pos += 1;
                 }
@@ -210,8 +243,7 @@ impl Parser {
             let word = if h.quoted {
                 vec![WordPart::Quoted(body)]
             } else {
-                let mut sub = Parser::new(&body);
-                sub.aliases = self.aliases.clone();
+                let mut sub = self.sub_parser(&body);
                 vec![WordPart::DQuote(sub.parse_dquote_body(None)?)]
             };
             *h.body.borrow_mut() = word;
@@ -220,29 +252,30 @@ impl Parser {
     }
 
     /// The raw token at the current position (up to whitespace or a metacharacter).
-    fn peek_token(&self) -> String {
+    #[inline]
+    fn peek_token(&self) -> &str {
+        let bytes = self.bytes();
         let mut i = self.pos;
-        let mut s = String::new();
-        while let Some(&c) = self.src.get(i) {
-            if is_meta(c) {
-                break;
-            }
-            s.push(c);
+        while i < bytes.len() && !is_meta_byte(bytes[i]) {
             i += 1;
         }
-        s
+        &self.src[self.pos..i]
     }
 
     fn expect_tok(&mut self, w: &str) -> PR<()> {
         self.skip_newlines()?;
         if self.peek_token() == w {
-            self.pos += w.chars().count();
+            self.pos += w.len();
             Ok(())
         } else if self.at_end() {
             self.err(&format!("expected `{}'", w))
         } else {
-            let t = self.peek_token();
-            self.err(&format!("syntax error: expected `{}' but found `{}'", w, if t.is_empty() { self.peek().unwrap().to_string() } else { t }))
+            let t = self.peek_token().to_string();
+            self.err(&format!(
+                "syntax error: expected `{}' but found `{}'",
+                w,
+                if t.is_empty() { self.peek().unwrap().to_string() } else { t }
+            ))
         }
     }
 
@@ -251,14 +284,13 @@ impl Parser {
     fn read_squote(&mut self) -> PR<String> {
         self.pos += 1;
         let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c == '\'' {
-                let s = self.text(start, self.pos);
-                self.pos += 1;
-                return Ok(s);
-            }
-            self.pos += 1;
+        if let Some(rel) = self.bytes()[start..].iter().position(|&b| b == b'\'') {
+            let end = start + rel;
+            let s = self.src[start..end].to_string();
+            self.pos = end + 1;
+            return Ok(s);
         }
+        self.pos = self.src.len();
         self.err("unterminated single quote")
     }
 
@@ -270,7 +302,7 @@ impl Parser {
                 Some(c) => c,
                 None => return self.err("unterminated $' quote"),
             };
-            self.pos += 1;
+            self.pos += c.len_utf8();
             if c == '\'' {
                 return Ok(out);
             }
@@ -282,7 +314,7 @@ impl Parser {
                 Some(e) => e,
                 None => return self.err("unterminated $' quote"),
             };
-            self.pos += 1;
+            self.pos += e.len_utf8();
             match e {
                 'n' => out.push('\n'),
                 't' => out.push('\t'),
@@ -301,7 +333,7 @@ impl Parser {
                     let mut v = 0u32;
                     let mut n = 0;
                     while n < max {
-                        match self.peek().and_then(|c| c.to_digit(16)) {
+                        match self.peek_byte().and_then(|b| (b as char).to_digit(16)) {
                             Some(d) => {
                                 v = v * 16 + d;
                                 self.pos += 1;
@@ -321,7 +353,7 @@ impl Parser {
                     let mut v = e.to_digit(8).unwrap();
                     let mut n = 1;
                     while n < 3 {
-                        match self.peek().and_then(|c| c.to_digit(8)) {
+                        match self.peek_byte().and_then(|b| (b as char).to_digit(8)) {
                             Some(d) => {
                                 v = v * 8 + d;
                                 self.pos += 1;
@@ -336,7 +368,7 @@ impl Parser {
                 }
                 'c' => {
                     if let Some(x) = self.peek() {
-                        self.pos += 1;
+                        self.pos += x.len_utf8();
                         out.push(((x as u8) & 0x1f) as char);
                     }
                 }
@@ -353,107 +385,119 @@ impl Parser {
     /// Parse the inside of a double-quoted string. With `end == None` the whole
     /// remaining input is taken (used for here-documents and runtime strings).
     pub fn parse_dquote_body(&mut self, end: Option<char>) -> PR<Vec<WordPart>> {
-        let mut parts = Vec::new();
-        let mut lit = String::new();
-        loop {
-            let c = match self.peek() {
-                Some(c) => c,
-                None => {
-                    if end.is_some() {
-                        return self.err("unterminated double quote");
+        self.enter()?;
+        let res = (|| {
+            let mut parts = Vec::new();
+            let mut lit = String::new();
+            loop {
+                let c = match self.peek() {
+                    Some(c) => c,
+                    None => {
+                        if end.is_some() {
+                            return self.err("unterminated double quote");
+                        }
+                        break;
                     }
+                };
+                if Some(c) == end {
+                    self.pos += c.len_utf8();
                     break;
                 }
-            };
-            if Some(c) == end {
-                self.pos += 1;
-                break;
-            }
-            match c {
-                '\\' => {
-                    self.pos += 1;
-                    match self.peek() {
-                        Some('\n') => self.pos += 1,
-                        Some(n) if n == '$' || n == '`' || n == '\\' || (n == '"' && end.is_some()) => {
-                            lit.push(n);
-                            self.pos += 1;
+                match c {
+                    '\\' => {
+                        self.pos += 1;
+                        match self.peek() {
+                            Some('\n') => self.pos += 1,
+                            Some(n) if n == '$' || n == '`' || n == '\\' || (n == '"' && end.is_some()) => {
+                                lit.push(n);
+                                self.pos += 1;
+                            }
+                            _ => lit.push('\\'),
                         }
-                        _ => lit.push('\\'),
                     }
-                }
-                '$' => {
-                    if !lit.is_empty() {
-                        parts.push(WordPart::Lit(std::mem::take(&mut lit)));
+                    '$' => {
+                        if !lit.is_empty() {
+                            parts.push(WordPart::Lit(std::mem::take(&mut lit)));
+                        }
+                        match self.parse_dollar(true)? {
+                            Some(p) => parts.push(p),
+                            None => lit.push('$'),
+                        }
                     }
-                    match self.parse_dollar(true)? {
-                        Some(p) => parts.push(p),
-                        None => lit.push('$'),
+                    '`' => {
+                        if !lit.is_empty() {
+                            parts.push(WordPart::Lit(std::mem::take(&mut lit)));
+                        }
+                        parts.push(self.parse_backtick(true)?);
                     }
-                }
-                '`' => {
-                    if !lit.is_empty() {
-                        parts.push(WordPart::Lit(std::mem::take(&mut lit)));
+                    _ => {
+                        lit.push(c);
+                        self.pos += c.len_utf8();
                     }
-                    parts.push(self.parse_backtick(true)?);
-                }
-                _ => {
-                    lit.push(c);
-                    self.pos += 1;
                 }
             }
-        }
-        if !lit.is_empty() {
-            parts.push(WordPart::Lit(lit));
-        }
-        Ok(parts)
+            if !lit.is_empty() {
+                parts.push(WordPart::Lit(lit));
+            }
+            Ok(parts)
+        })();
+        self.leave();
+        res
     }
 
     fn sub_parser(&self, text: &str) -> Parser {
         let mut p = Parser::new(text);
         p.aliases = self.aliases.clone();
+        p.depth = self.depth.saturating_add(1);
         p
     }
 
     fn parse_backtick(&mut self, in_dq: bool) -> PR<WordPart> {
-        self.pos += 1;
-        let mut text = String::new();
-        loop {
-            let c = match self.peek() {
-                Some(c) => c,
-                None => return self.err("unterminated backquote"),
-            };
+        self.enter()?;
+        let res = (|| {
             self.pos += 1;
-            if c == '`' {
-                break;
-            }
-            if c == '\\' {
-                match self.peek() {
-                    Some(n) if n == '$' || n == '`' || n == '\\' || (in_dq && n == '"') => {
-                        text.push(n);
-                        self.pos += 1;
-                    }
-                    _ => text.push('\\'),
+            let mut text = String::new();
+            loop {
+                let c = match self.peek() {
+                    Some(c) => c,
+                    None => return self.err("unterminated backquote"),
+                };
+                self.pos += c.len_utf8();
+                if c == '`' {
+                    break;
                 }
-            } else {
-                text.push(c);
+                if c == '\\' {
+                    match self.peek() {
+                        Some(n) if n == '$' || n == '`' || n == '\\' || (in_dq && n == '"') => {
+                            text.push(n);
+                            self.pos += 1;
+                        }
+                        _ => text.push('\\'),
+                    }
+                } else {
+                    text.push(c);
+                }
             }
-        }
-        let mut sub = self.sub_parser(&text);
-        let cmd = sub.parse_all()?;
-        Ok(WordPart::CmdSubst(Rc::new(cmd)))
+            let mut sub = self.sub_parser(&text);
+            let cmd = sub.parse_all()?;
+            Ok(WordPart::CmdSubst(Rc::new(cmd)))
+        })();
+        self.leave();
+        res
     }
 
     /// Find the `))` closing an arithmetic expression starting at `start`.
-    /// Ok(Some(i)) = index of the first `)`; Ok(None) = not arithmetic; Err = hit EOF.
+    /// Ok(Some(i)) = byte index of the first `)`; Ok(None) = not arithmetic; Err = hit EOF.
     fn scan_arith(&self, start: usize) -> Result<Option<usize>, ()> {
-        let mut depth = 0;
+        let bytes = self.bytes();
+        let mut depth = 0u32;
         let mut i = start;
-        while i < self.src.len() {
-            match self.src[i] {
-                '(' => depth += 1,
-                ')' => {
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
                     if depth == 0 {
-                        return Ok(if self.src.get(i + 1) == Some(&')') { Some(i) } else { None });
+                        return Ok(if bytes.get(i + 1) == Some(&b')') { Some(i) } else { None });
                     }
                     depth -= 1;
                 }
@@ -466,15 +510,15 @@ impl Parser {
 
     fn parse_dollar(&mut self, in_dq: bool) -> PR<Option<WordPart>> {
         // at '$'
-        let n = match self.peek_at(1) {
+        let n = match self.peek_byte_at(1) {
             Some(n) => n,
             None => {
                 self.pos += 1;
                 return Ok(None);
             }
         };
-        if n == '(' {
-            if self.peek_at(2) == Some('(') {
+        if n == b'(' {
+            if self.peek_byte_at(2) == Some(b'(') {
                 match self.scan_arith(self.pos + 3) {
                     Ok(Some(end)) => {
                         let raw = self.text(self.pos + 3, end);
@@ -492,33 +536,30 @@ impl Parser {
             let cmd = self.parse_nested()?;
             return Ok(Some(WordPart::CmdSubst(Rc::new(cmd))));
         }
-        if n == '{' {
+        if n == b'{' {
             return Ok(Some(self.parse_braced_param(in_dq)?));
         }
-        if n == '\'' && !in_dq {
+        if n == b'\'' && !in_dq {
             self.pos += 2;
             return Ok(Some(WordPart::Quoted(self.read_ansi_c()?)));
         }
-        if n == '"' && !in_dq {
+        if n == b'"' && !in_dq {
             self.pos += 2;
             return Ok(Some(WordPart::DQuote(self.parse_dquote_body(Some('"'))?)));
         }
         let plain = |name: String| WordPart::Param(Box::new(ParamExp { name, index: None, indirect: false, op: ParamOp::Plain }));
-        if n.is_ascii_alphabetic() || n == '_' {
+        if n.is_ascii_alphabetic() || n == b'_' {
             self.pos += 1;
             let start = self.pos;
-            while let Some(c) = self.peek() {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
+            let bytes = self.src.as_bytes();
+            while self.pos < bytes.len() && (bytes[self.pos].is_ascii_alphanumeric() || bytes[self.pos] == b'_') {
+                self.pos += 1;
             }
             return Ok(Some(plain(self.text(start, self.pos))));
         }
-        if n.is_ascii_digit() || matches!(n, '@' | '*' | '#' | '?' | '$' | '!' | '-') {
+        if n.is_ascii_digit() || matches!(n, b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-') {
             self.pos += 2;
-            return Ok(Some(plain(n.to_string())));
+            return Ok(Some(plain((n as char).to_string())));
         }
         self.pos += 1;
         Ok(None)
@@ -526,33 +567,41 @@ impl Parser {
 
     /// Parse a command list nested in `$(`, `<(` ... up to and including `)`.
     fn parse_nested(&mut self) -> PR<Cmd> {
+        self.enter()?;
         let saved = std::mem::take(&mut self.extra_stop);
         let saved_re = std::mem::replace(&mut self.regex_mode, false);
-        let cmd = self.parse_list(false)?;
-        self.skip_newlines()?;
+        let res = (|| {
+            let cmd = self.parse_list(false)?;
+            self.skip_newlines()?;
+            if !self.eat(")") {
+                if self.at_end() {
+                    return self.err("unterminated command substitution");
+                }
+                return self.unexpected();
+            }
+            Ok(cmd)
+        })();
         self.extra_stop = saved;
         self.regex_mode = saved_re;
-        if !self.eat(")") {
-            if self.at_end() {
-                return self.err("unterminated command substitution");
-            }
-            return self.unexpected();
-        }
-        Ok(cmd)
+        self.leave();
+        res
     }
 
-    fn read_balanced(&mut self, open: char, close: char) -> PR<String> {
-        // positioned after the opening char; consumes the closing char
+    fn read_balanced(&mut self, open: u8, close: u8) -> PR<String> {
+        // positioned after the opening ASCII char; consumes the closing ASCII char
         let start = self.pos;
-        let mut depth = 0;
-        while let Some(c) = self.peek() {
-            if c == '\\' {
-                self.pos += 2;
+        let mut depth = 0u32;
+        while let Some(b) = self.peek_byte() {
+            if b == b'\\' {
+                self.pos += 1;
+                if let Some(next_c) = self.peek() {
+                    self.pos += next_c.len_utf8();
+                }
                 continue;
             }
-            if c == open {
+            if b == open {
                 depth += 1;
-            } else if c == close {
+            } else if b == close {
                 if depth == 0 {
                     let s = self.text(start, self.pos);
                     self.pos += 1;
@@ -563,175 +612,175 @@ impl Parser {
             self.pos += 1;
         }
         self.pos = self.src.len();
-        self.err(&format!("missing `{}'", close))
+        self.err(&format!("missing `{}'", close as char))
     }
 
     fn parse_braced_param(&mut self, in_dq: bool) -> PR<WordPart> {
-        self.pos += 2;
-        let mut length = false;
-        let mut indirect = false;
-        if self.peek() == Some('#') && !matches!(self.peek_at(1), Some('}') | None) {
-            length = true;
-            self.pos += 1;
-        } else if self.peek() == Some('!') && !matches!(self.peek_at(1), Some('}') | None) {
-            indirect = true;
-            self.pos += 1;
-        }
-        let start = self.pos;
-        match self.peek() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
-                }
+        self.enter()?;
+        let res = (|| {
+            self.pos += 2;
+            let mut length = false;
+            let mut indirect = false;
+            if self.peek_byte() == Some(b'#') && !matches!(self.peek_byte_at(1), Some(b'}') | None) {
+                length = true;
+                self.pos += 1;
+            } else if self.peek_byte() == Some(b'!') && !matches!(self.peek_byte_at(1), Some(b'}') | None) {
+                indirect = true;
+                self.pos += 1;
             }
-            Some(c) if c.is_ascii_digit() => {
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() {
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            Some(c) if matches!(c, '@' | '*' | '#' | '?' | '$' | '!' | '-') => self.pos += 1,
-            _ => return self.err("bad substitution"),
-        }
-        let name = self.text(start, self.pos);
-        let mut index = None;
-        if self.peek() == Some('[') {
-            self.pos += 1;
-            index = Some(self.read_balanced('[', ']')?);
-        }
-        let mut op = ParamOp::Plain;
-        if indirect && matches!(index.as_deref(), Some("@") | Some("*")) {
-            indirect = false;
-            op = ParamOp::Keys;
-        }
-        if length {
-            op = ParamOp::Length;
-        }
-        let c = match self.peek() {
-            Some(c) => c,
-            None => return self.err("unterminated ${"),
-        };
-        if c != '}' {
-            if length || matches!(op, ParamOp::Keys) {
-                return self.err("bad substitution");
-            }
-            let two = self.peek_at(1);
-            match c {
-                ':' if matches!(two, Some('-') | Some('=') | Some('+') | Some('?')) => {
-                    self.pos += 2;
-                    let w = self.parse_brace_word(in_dq, false, in_dq)?;
-                    op = match two.unwrap() {
-                        '-' => ParamOp::Default(true, w),
-                        '=' => ParamOp::Assign(true, w),
-                        '+' => ParamOp::Alt(true, w),
-                        _ => ParamOp::Error(true, w),
-                    };
-                }
-                ':' => {
-                    self.pos += 1;
-                    let mut off = String::new();
-                    let mut len = None;
-                    let mut depth = 0;
-                    loop {
-                        match self.peek() {
-                            None => return self.err("unterminated ${"),
-                            Some('}') if depth == 0 => break,
-                            Some(':') if depth == 0 && len.is_none() => {
-                                len = Some(String::new());
-                            }
-                            Some(ch) => {
-                                if ch == '(' || ch == '{' {
-                                    depth += 1;
-                                } else if (ch == ')' || ch == '}') && depth > 0 {
-                                    depth -= 1;
-                                }
-                                match len.as_mut() {
-                                    Some(l) => l.push(ch),
-                                    None => off.push(ch),
-                                }
-                            }
-                        }
+            let start = self.pos;
+            match self.peek_byte() {
+                Some(b) if b.is_ascii_alphabetic() || b == b'_' => {
+                    let bytes = self.src.as_bytes();
+                    while self.pos < bytes.len() && (bytes[self.pos].is_ascii_alphanumeric() || bytes[self.pos] == b'_') {
                         self.pos += 1;
                     }
-                    op = ParamOp::Substr(off, len);
                 }
-                '-' | '=' | '+' | '?' => {
-                    self.pos += 1;
-                    let w = self.parse_brace_word(in_dq, false, in_dq)?;
-                    op = match c {
-                        '-' => ParamOp::Default(false, w),
-                        '=' => ParamOp::Assign(false, w),
-                        '+' => ParamOp::Alt(false, w),
-                        _ => ParamOp::Error(false, w),
-                    };
-                }
-                '#' | '%' => {
-                    self.pos += 1;
-                    let long = self.peek() == Some(c);
-                    if long {
+                Some(b) if b.is_ascii_digit() => {
+                    let bytes = self.src.as_bytes();
+                    while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
                         self.pos += 1;
                     }
-                    let w = self.parse_brace_word(false, false, false)?;
-                    op = if c == '#' { ParamOp::TrimPrefix(long, w) } else { ParamOp::TrimSuffix(long, w) };
                 }
-                '/' => {
-                    self.pos += 1;
-                    let mode = match self.peek() {
-                        Some('/') => {
-                            self.pos += 1;
-                            'a'
-                        }
-                        Some('#') => {
-                            self.pos += 1;
-                            '#'
-                        }
-                        Some('%') => {
-                            self.pos += 1;
-                            '%'
-                        }
-                        _ => '/',
-                    };
-                    let pat = self.parse_brace_word(false, true, false)?;
-                    let rep = if self.peek() == Some('/') {
-                        self.pos += 1;
-                        self.parse_brace_word(in_dq, false, in_dq)?
-                    } else {
-                        Vec::new()
-                    };
-                    op = ParamOp::Replace { mode, pat, rep };
-                }
-                '^' | ',' => {
-                    self.pos += 1;
-                    let all = self.peek() == Some(c);
-                    if all {
-                        self.pos += 1;
-                    }
-                    op = ParamOp::Case { upper: c == '^', all };
-                }
-                '@' => {
-                    self.pos += 1;
-                    match self.peek() {
-                        Some(t) if t.is_ascii_alphabetic() => {
-                            self.pos += 1;
-                            op = ParamOp::Transform(t);
-                        }
-                        _ => return self.err("bad substitution"),
-                    }
-                }
+                Some(b) if matches!(b, b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-') => self.pos += 1,
                 _ => return self.err("bad substitution"),
             }
-        }
-        if !self.eat("}") {
-            return self.err("bad substitution: missing `}'");
-        }
-        Ok(WordPart::Param(Box::new(ParamExp { name, index, indirect, op })))
+            let name = self.text(start, self.pos);
+            let mut index = None;
+            if self.peek_byte() == Some(b'[') {
+                self.pos += 1;
+                index = Some(self.read_balanced(b'[', b']')?);
+            }
+            let mut op = ParamOp::Plain;
+            if indirect && matches!(index.as_deref(), Some("@") | Some("*")) {
+                indirect = false;
+                op = ParamOp::Keys;
+            }
+            if length {
+                op = ParamOp::Length;
+            }
+            let c = match self.peek_byte() {
+                Some(c) => c,
+                None => return self.err("unterminated ${"),
+            };
+            if c != b'}' {
+                if length || matches!(op, ParamOp::Keys) {
+                    return self.err("bad substitution");
+                }
+                let two = self.peek_byte_at(1);
+                match c {
+                    b':' if matches!(two, Some(b'-') | Some(b'=') | Some(b'+') | Some(b'?')) => {
+                        self.pos += 2;
+                        let w = self.parse_brace_word(in_dq, false, in_dq)?;
+                        op = match two.unwrap() {
+                            b'-' => ParamOp::Default(true, w),
+                            b'=' => ParamOp::Assign(true, w),
+                            b'+' => ParamOp::Alt(true, w),
+                            _ => ParamOp::Error(true, w),
+                        };
+                    }
+                    b':' => {
+                        self.pos += 1;
+                        let mut off = String::new();
+                        let mut len = None;
+                        let mut depth = 0u32;
+                        loop {
+                            match self.peek() {
+                                None => return self.err("unterminated ${"),
+                                Some('}') if depth == 0 => break,
+                                Some(':') if depth == 0 && len.is_none() => {
+                                    len = Some(String::new());
+                                    self.pos += 1;
+                                }
+                                Some(ch) => {
+                                    if ch == '(' || ch == '{' {
+                                        depth += 1;
+                                    } else if (ch == ')' || ch == '}') && depth > 0 {
+                                        depth -= 1;
+                                    }
+                                    match len.as_mut() {
+                                        Some(l) => l.push(ch),
+                                        None => off.push(ch),
+                                    }
+                                    self.pos += ch.len_utf8();
+                                }
+                            }
+                        }
+                        op = ParamOp::Substr(off, len);
+                    }
+                    b'-' | b'=' | b'+' | b'?' => {
+                        self.pos += 1;
+                        let w = self.parse_brace_word(in_dq, false, in_dq)?;
+                        op = match c {
+                            b'-' => ParamOp::Default(false, w),
+                            b'=' => ParamOp::Assign(false, w),
+                            b'+' => ParamOp::Alt(false, w),
+                            _ => ParamOp::Error(false, w),
+                        };
+                    }
+                    b'#' | b'%' => {
+                        self.pos += 1;
+                        let long = self.peek_byte() == Some(c);
+                        if long {
+                            self.pos += 1;
+                        }
+                        let w = self.parse_brace_word(false, false, false)?;
+                        op = if c == b'#' { ParamOp::TrimPrefix(long, w) } else { ParamOp::TrimSuffix(long, w) };
+                    }
+                    b'/' => {
+                        self.pos += 1;
+                        let mode = match self.peek_byte() {
+                            Some(b'/') => {
+                                self.pos += 1;
+                                'a'
+                            }
+                            Some(b'#') => {
+                                self.pos += 1;
+                                '#'
+                            }
+                            Some(b'%') => {
+                                self.pos += 1;
+                                '%'
+                            }
+                            _ => '/',
+                        };
+                        let pat = self.parse_brace_word(false, true, false)?;
+                        let rep = if self.peek_byte() == Some(b'/') {
+                            self.pos += 1;
+                            self.parse_brace_word(in_dq, false, in_dq)?
+                        } else {
+                            Vec::new()
+                        };
+                        op = ParamOp::Replace { mode, pat, rep };
+                    }
+                    b'^' | b',' => {
+                        self.pos += 1;
+                        let all = self.peek_byte() == Some(c);
+                        if all {
+                            self.pos += 1;
+                        }
+                        op = ParamOp::Case { upper: c == b'^', all };
+                    }
+                    b'@' => {
+                        self.pos += 1;
+                        match self.peek_byte() {
+                            Some(t) if t.is_ascii_alphabetic() => {
+                                self.pos += 1;
+                                op = ParamOp::Transform(t as char);
+                            }
+                            _ => return self.err("bad substitution"),
+                        }
+                    }
+                    _ => return self.err("bad substitution"),
+                }
+            }
+            if !self.eat("}") {
+                return self.err("bad substitution: missing `}'");
+            }
+            Ok(WordPart::Param(Box::new(ParamExp { name, index, indirect, op })))
+        })();
+        self.leave();
+        res
     }
 
     /// Parse the operand of a `${x<op>word}` expansion, up to (not including) `}`.
@@ -766,7 +815,7 @@ impl Parser {
                                 flush!();
                                 parts.push(WordPart::Quoted(n.to_string()));
                             }
-                            self.pos += 1;
+                            self.pos += n.len_utf8();
                         }
                     }
                 }
@@ -792,7 +841,7 @@ impl Parser {
                 }
                 _ => {
                     lit.push(c);
-                    self.pos += 1;
+                    self.pos += c.len_utf8();
                 }
             }
         }
@@ -836,7 +885,7 @@ impl Parser {
                 }
                 ';' | '&' | '|' | ')' => break,
                 '<' | '>' => {
-                    if self.peek_at(1) == Some('(') {
+                    if self.peek_byte_at(1) == Some(b'(') {
                         flush!();
                         self.pos += 2;
                         let cmd = self.parse_nested()?;
@@ -848,7 +897,7 @@ impl Parser {
                 '(' => {
                     if lit.ends_with(['?', '*', '+', '@', '!']) {
                         self.pos += 1;
-                        let inner = self.read_balanced('(', ')')?;
+                        let inner = self.read_balanced(b'(', b')')?;
                         lit.push('(');
                         lit.push_str(&inner);
                         lit.push(')');
@@ -864,7 +913,7 @@ impl Parser {
                         Some(n) => {
                             flush!();
                             parts.push(WordPart::Quoted(n.to_string()));
-                            self.pos += 1;
+                            self.pos += n.len_utf8();
                         }
                     }
                 }
@@ -889,18 +938,20 @@ impl Parser {
                     }
                 }
                 '~' if self.pos == start || (assign && parts.iter().all(|p| matches!(p, WordPart::Lit(_))) && (lit.ends_with(':') || (lit.is_empty() && parts.is_empty()))) => {
+                    let bytes = self.bytes();
                     let mut i = self.pos + 1;
-                    while let Some(&ch) = self.src.get(i) {
-                        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-' | '+') {
+                    while i < bytes.len() {
+                        let ch = bytes[i];
+                        if ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'.' | b'-' | b'+') {
                             i += 1;
                         } else {
                             break;
                         }
                     }
-                    let next = self.src.get(i).copied();
+                    let next = bytes.get(i).copied();
                     let ok = match next {
                         None => true,
-                        Some(ch) => ch == '/' || is_meta(ch) || (assign && ch == ':'),
+                        Some(ch) => ch == b'/' || is_meta_byte(ch) || (assign && ch == b':'),
                     };
                     if ok {
                         flush!();
@@ -913,7 +964,7 @@ impl Parser {
                 }
                 _ => {
                     lit.push(c);
-                    self.pos += 1;
+                    self.pos += c.len_utf8();
                 }
             }
         }
@@ -926,15 +977,16 @@ impl Parser {
     fn parse_redir(&mut self) -> PR<Option<Redir>> {
         let save = self.pos;
         let mut fd = None;
+        let bytes = self.bytes();
         let mut i = self.pos;
-        while i < self.src.len() && self.src[i].is_ascii_digit() {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
             i += 1;
         }
-        if i > self.pos && i < self.src.len() && (self.src[i] == '<' || self.src[i] == '>') {
-            fd = self.text(self.pos, i).parse::<i32>().ok();
+        if i > self.pos && i < bytes.len() && (bytes[i] == b'<' || bytes[i] == b'>') {
+            fd = self.src[self.pos..i].parse::<i32>().ok();
             self.pos = i;
         }
-        let c = match self.peek() {
+        let c = match self.peek_byte() {
             Some(c) => c,
             None => {
                 self.pos = save;
@@ -942,14 +994,14 @@ impl Parser {
             }
         };
         let mut heredoc = None;
-        let kind = if c == '&' && fd.is_none() && self.peek_at(1) == Some('>') {
+        let kind = if c == b'&' && fd.is_none() && self.peek_byte_at(1) == Some(b'>') {
             self.pos += 2;
             if self.eat(">") {
                 RedirKind::AppendErr
             } else {
                 RedirKind::OutErr
             }
-        } else if c == '<' && self.peek_at(1) != Some('(') {
+        } else if c == b'<' && self.peek_byte_at(1) != Some(b'(') {
             self.pos += 1;
             if self.eat("<<") {
                 RedirKind::HereStr
@@ -966,7 +1018,7 @@ impl Parser {
             } else {
                 RedirKind::In
             }
-        } else if c == '>' && self.peek_at(1) != Some('(') {
+        } else if c == b'>' && self.peek_byte_at(1) != Some(b'(') {
             self.pos += 1;
             if self.eat(">") {
                 RedirKind::Append
@@ -1043,65 +1095,67 @@ impl Parser {
     }
 
     fn at_list_end(&self) -> bool {
-        match self.peek() {
-            None | Some(')') => true,
-            Some(';') => self.starts(";;") || self.starts(";&"),
-            _ => {
-                let t = self.peek_token();
-                CLOSERS.contains(&t.as_str())
-            }
+        match self.peek_byte() {
+            None | Some(b')') => true,
+            Some(b';') => self.starts(";;") || self.starts(";&"),
+            _ => CLOSERS.contains(&self.peek_token()),
         }
     }
 
     fn parse_list(&mut self, top: bool) -> PR<Cmd> {
-        let mut items: Vec<ListItem> = Vec::new();
-        loop {
-            if top {
-                self.skip_ws();
-                if self.peek() == Some('\n') {
-                    self.consume_newline()?;
+        self.enter()?;
+        let res = (|| {
+            let mut items: Vec<ListItem> = Vec::new();
+            loop {
+                if top {
+                    self.skip_ws();
+                    if self.peek_byte() == Some(b'\n') {
+                        self.consume_newline()?;
+                        break;
+                    }
+                } else {
+                    self.skip_newlines()?;
+                }
+                if self.at_list_end() {
                     break;
                 }
-            } else {
-                self.skip_newlines()?;
-            }
-            if self.at_list_end() {
-                break;
-            }
-            let start = self.pos;
-            let cmd = self.parse_and_or()?;
-            let end = self.pos;
-            self.skip_ws();
-            let mut bg = false;
-            let mut done = false;
-            if self.starts(";;") || self.starts(";&") {
-                done = true;
-            } else {
-                match self.peek() {
-                    Some(';') => self.pos += 1,
-                    Some('&') => {
-                        self.pos += 1;
-                        bg = true;
-                    }
-                    Some('\n') => {
-                        self.consume_newline()?;
-                        if top {
-                            done = true;
+                let start = self.pos;
+                let cmd = self.parse_and_or()?;
+                let end = self.pos;
+                self.skip_ws();
+                let mut bg = false;
+                let mut done = false;
+                if self.starts(";;") || self.starts(";&") {
+                    done = true;
+                } else {
+                    match self.peek_byte() {
+                        Some(b';') => self.pos += 1,
+                        Some(b'&') => {
+                            self.pos += 1;
+                            bg = true;
                         }
+                        Some(b'\n') => {
+                            self.consume_newline()?;
+                            if top {
+                                done = true;
+                            }
+                        }
+                        _ => done = true,
                     }
-                    _ => done = true,
+                }
+                let text = if bg || top { Some(self.src[start..end].trim().to_string()) } else { None };
+                items.push(ListItem { cmd, bg, text });
+                if done {
+                    break;
                 }
             }
-            let text = if bg || top { Some(self.text(start, end).trim().to_string()) } else { None };
-            items.push(ListItem { cmd, bg, text });
-            if done {
-                break;
+            if items.len() == 1 && !items[0].bg && !top {
+                return Ok(items.pop().unwrap().cmd);
             }
-        }
-        if items.len() == 1 && !items[0].bg && !top {
-            return Ok(items.pop().unwrap().cmd);
-        }
-        Ok(Cmd::List(items))
+            Ok(Cmd::List(items))
+        })();
+        self.leave();
+        res
     }
 
     fn parse_and_or(&mut self) -> PR<Cmd> {
@@ -1144,14 +1198,14 @@ impl Parser {
         }
         if timed {
             self.skip_ws();
-            if matches!(self.peek(), None | Some('\n') | Some(';')) {
+            if matches!(self.peek_byte(), None | Some(b'\n') | Some(b';')) {
                 return Ok(Cmd::Pipeline { cmds: vec![], negate, timed });
             }
         }
         let mut cmds = vec![self.parse_command()?];
         loop {
             self.skip_ws();
-            if self.peek() == Some('|') && self.peek_at(1) != Some('|') {
+            if self.peek_byte() == Some(b'|') && self.peek_byte_at(1) != Some(b'|') {
                 self.pos += 1;
                 if self.eat("&") {
                     let last = cmds.pop().unwrap();
@@ -1171,10 +1225,17 @@ impl Parser {
     }
 
     fn parse_command(&mut self) -> PR<Cmd> {
+        self.enter()?;
+        let res = self.parse_command_inner();
+        self.leave();
+        res
+    }
+
+    fn parse_command_inner(&mut self) -> PR<Cmd> {
         self.skip_ws();
-        let tok = self.peek_token();
+        let tok_len = self.peek_token().len();
         let start = self.pos;
-        let cmd = match tok.as_str() {
+        let cmd = match &self.src[start..start + tok_len] {
             "{" => {
                 self.pos += 1;
                 let body = self.parse_list(false)?;
@@ -1206,12 +1267,13 @@ impl Parser {
                 Cmd::If { conds, else_ }
             }
             "while" | "until" => {
+                let until = self.peek_byte() == Some(b'u');
                 self.pos += 5;
                 let cond = self.parse_list(false)?;
                 self.expect_tok("do")?;
                 let body = self.parse_list(false)?;
                 self.expect_tok("done")?;
-                Cmd::While { cond: Box::new(cond), body: Box::new(body), until: tok == "until" }
+                Cmd::While { cond: Box::new(cond), body: Box::new(body), until }
             }
             "for" => {
                 self.pos += 3;
@@ -1235,11 +1297,11 @@ impl Parser {
                     let body = self.parse_loop_body()?;
                     Cmd::CFor { init, cond, step, body: Box::new(body) }
                 } else {
-                    let var = self.peek_token();
+                    let var = self.peek_token().to_string();
                     if !is_name(&var) {
                         return self.err(&format!("`{}': not a valid identifier", var));
                     }
-                    self.pos += var.chars().count();
+                    self.pos += var.len();
                     self.skip_ws();
                     self.eat(";");
                     self.skip_newlines()?;
@@ -1249,8 +1311,8 @@ impl Parser {
                         let mut ws = Vec::new();
                         loop {
                             self.skip_ws();
-                            match self.peek() {
-                                None | Some('\n') | Some(';') => break,
+                            match self.peek_byte() {
+                                None | Some(b'\n') | Some(b';') => break,
                                 _ => {
                                     let w = self.parse_word()?;
                                     if w.is_empty() {
@@ -1384,11 +1446,11 @@ impl Parser {
                 }
                 Cmd::Cond(e)
             }
-            _ => {
-                if CLOSERS.contains(&tok.as_str()) {
+            tok => {
+                if CLOSERS.contains(&tok) {
                     return self.unexpected();
                 }
-                if self.peek() == Some('(') {
+                if self.peek_byte() == Some(b'(') {
                     let mut arith = None;
                     if self.starts("((") {
                         match self.scan_arith(self.pos + 2) {
@@ -1458,8 +1520,10 @@ impl Parser {
 
     fn read_func_name(&mut self) -> String {
         let start = self.pos;
-        while let Some(c) = self.peek() {
-            if is_meta(c) || matches!(c, '"' | '\'' | '$' | '`' | '\\' | '{' | '}') {
+        let bytes = self.src.as_bytes();
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+            if is_meta_byte(b) || matches!(b, b'"' | b'\'' | b'$' | b'`' | b'\\' | b'{' | b'}') {
                 break;
             }
             self.pos += 1;
@@ -1469,9 +1533,11 @@ impl Parser {
 
     /// Detect `name ( )` and consume it.
     fn try_func_header(&mut self) -> Option<String> {
+        let bytes = self.bytes();
         let mut i = self.pos;
-        while let Some(&c) = self.src.get(i) {
-            if is_meta(c) || matches!(c, '"' | '\'' | '$' | '`' | '\\' | '=' | '{' | '}') {
+        while i < bytes.len() {
+            let b = bytes[i];
+            if is_meta_byte(b) || matches!(b, b'"' | b'\'' | b'$' | b'`' | b'\\' | b'=' | b'{' | b'}') {
                 break;
             }
             i += 1;
@@ -1479,20 +1545,21 @@ impl Parser {
         if i == self.pos {
             return None;
         }
-        let name = self.text(self.pos, i);
-        while matches!(self.src.get(i), Some(' ') | Some('\t')) {
+        let name_end = i;
+        while matches!(bytes.get(i), Some(b' ') | Some(b'\t')) {
             i += 1;
         }
-        if self.src.get(i) != Some(&'(') {
+        if bytes.get(i) != Some(&b'(') {
             return None;
         }
         i += 1;
-        while matches!(self.src.get(i), Some(' ') | Some('\t')) {
+        while matches!(bytes.get(i), Some(b' ') | Some(b'\t')) {
             i += 1;
         }
-        if self.src.get(i) != Some(&')') {
+        if bytes.get(i) != Some(&b')') {
             return None;
         }
+        let name = self.text(self.pos, name_end);
         self.pos = i + 1;
         Some(name)
     }
@@ -1506,12 +1573,9 @@ impl Parser {
             }
             let rest = self.eat("...");
             let start = self.pos;
-            while let Some(c) = self.peek() {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
+            let bytes = self.src.as_bytes();
+            while self.pos < bytes.len() && (bytes[self.pos].is_ascii_alphanumeric() || bytes[self.pos] == b'_') {
+                self.pos += 1;
             }
             let name = self.text(start, self.pos);
             if !is_name(&name) {
@@ -1538,34 +1602,31 @@ impl Parser {
     }
 
     fn try_parse_assign(&mut self) -> PR<Option<Assign>> {
+        let bytes = self.bytes();
         let mut i = self.pos;
-        match self.src.get(i) {
-            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {}
+        match bytes.get(i) {
+            Some(b) if b.is_ascii_alphabetic() || *b == b'_' => {}
             _ => return Ok(None),
         }
-        while let Some(&c) = self.src.get(i) {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                i += 1;
-            } else {
-                break;
-            }
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
         }
-        let name = self.text(self.pos, i);
-        let mut index = None;
-        if self.src.get(i) == Some(&'[') {
-            let mut depth = 0;
+        let name_end = i;
+        let mut index_range: Option<(usize, usize)> = None;
+        if bytes.get(i) == Some(&b'[') {
+            let mut depth = 0u32;
             let mut j = i + 1;
             let mut found = false;
-            while let Some(&c) = self.src.get(j) {
-                if c == '[' {
+            while let Some(&b) = bytes.get(j) {
+                if b == b'[' {
                     depth += 1;
-                } else if c == ']' {
+                } else if b == b']' {
                     if depth == 0 {
                         found = true;
                         break;
                     }
                     depth -= 1;
-                } else if c == '\n' {
+                } else if b == b'\n' {
                     break;
                 }
                 j += 1;
@@ -1573,19 +1634,21 @@ impl Parser {
             if !found {
                 return Ok(None);
             }
-            index = Some(self.text(i + 1, j));
+            index_range = Some((i + 1, j));
             i = j + 1;
         }
         let mut append = false;
-        if self.src.get(i) == Some(&'+') {
+        if bytes.get(i) == Some(&b'+') {
             append = true;
             i += 1;
         }
-        if self.src.get(i) != Some(&'=') {
+        if bytes.get(i) != Some(&b'=') {
             return Ok(None);
         }
+        let name = self.text(self.pos, name_end);
+        let index = index_range.map(|(a, b)| self.text(a, b));
         self.pos = i + 1;
-        if self.peek() == Some('(') && index.is_none() {
+        if self.peek_byte() == Some(b'(') && index.is_none() {
             self.pos += 1;
             let mut elems = Vec::new();
             loop {
@@ -1597,11 +1660,11 @@ impl Parser {
                     return self.err("unterminated array literal");
                 }
                 let mut key = None;
-                if self.peek() == Some('[') {
+                if self.peek_byte() == Some(b'[') {
                     let save = self.pos;
                     self.pos += 1;
-                    match self.read_balanced('[', ']') {
-                        Ok(k) if self.peek() == Some('=') => {
+                    match self.read_balanced(b'[', b']') {
+                        Ok(k) if self.peek_byte() == Some(b'=') => {
                             self.pos += 1;
                             key = Some(k);
                         }
@@ -1624,6 +1687,7 @@ impl Parser {
         let line = self.line();
         let mut sc = SimpleCmd { assigns: Vec::new(), words: Vec::new(), redirs: Vec::new(), line };
         let mut decl = false;
+        let mut alias_count = 0usize;
         self.alias_guard.clear();
         loop {
             self.skip_ws();
@@ -1631,9 +1695,9 @@ impl Parser {
                 sc.redirs.push(r);
                 continue;
             }
-            match self.peek() {
-                None | Some('\n') | Some(';') | Some('&') | Some('|') | Some(')') => break,
-                Some('(') => return self.unexpected(),
+            match self.peek_byte() {
+                None | Some(b'\n') | Some(b';') | Some(b'&') | Some(b'|') | Some(b')') => break,
+                Some(b'(') => return self.unexpected(),
                 _ => {}
             }
             if sc.words.is_empty() || decl {
@@ -1647,17 +1711,31 @@ impl Parser {
                 }
             }
             if sc.words.is_empty() && !self.aliases.is_empty() {
-                let tok = self.peek_token();
-                if !self.alias_guard.contains(&tok) {
-                    if let Some(val) = self.aliases.get(&tok) {
-                        let val: Vec<char> = val.chars().collect();
-                        let n = tok.chars().count();
-                        self.src.splice(self.pos..self.pos + n, val);
+                let tok_str = self.peek_token();
+                if !self.alias_guard.iter().any(|g| g == tok_str) {
+                    if let Some(val) = self.aliases.get(tok_str).cloned() {
+                        alias_count += 1;
+                        if alias_count > MAX_ALIAS_EXPANSIONS {
+                            return Err(ParseError {
+                                msg: "alias expansion limit exceeded".to_string(),
+                                incomplete: false,
+                                line: self.line(),
+                            });
+                        }
+                        let tok = tok_str.to_string();
+                        self.src.replace_range(self.pos..self.pos + tok.len(), &val);
+                        if self.line_cache.0 > self.pos {
+                            self.line_cache = (0, 1);
+                        }
                         self.alias_guard.push(tok);
                         // an alias may expand to a compound command or reserved word
                         self.skip_ws();
                         let t = self.peek_token();
-                        if sc.assigns.is_empty() && sc.redirs.is_empty() && (RESERVED.contains(&t.as_str()) || self.peek() == Some('(')) && !CLOSERS.contains(&t.as_str()) {
+                        if sc.assigns.is_empty()
+                            && sc.redirs.is_empty()
+                            && (RESERVED.contains(&t) || self.peek_byte() == Some(b'('))
+                            && !CLOSERS.contains(&t)
+                        {
                             return self.parse_pipeline();
                         }
                         continue;
@@ -1669,8 +1747,8 @@ impl Parser {
                 return self.unexpected();
             }
             if sc.words.is_empty() {
-                if let Some(l) = word_literal(&w) {
-                    decl = DECL.contains(&l.as_str());
+                if let Some(l) = word_literal_str(&w) {
+                    decl = DECL.contains(&l);
                 }
             }
             sc.words.push(w);
@@ -1686,7 +1764,7 @@ impl Parser {
     fn cond_ws(&mut self) {
         loop {
             self.skip_ws();
-            if self.peek() == Some('\n') {
+            if self.peek_byte() == Some(b'\n') {
                 self.pos += 1;
             } else {
                 break;
@@ -1721,21 +1799,26 @@ impl Parser {
     }
 
     fn cond_not(&mut self) -> PR<CondExpr> {
-        self.cond_ws();
-        if self.peek_token() == "!" {
-            self.pos += 1;
-            return Ok(CondExpr::Not(Box::new(self.cond_not()?)));
-        }
-        if self.peek() == Some('(') {
-            self.pos += 1;
-            let e = self.cond_or()?;
+        self.enter()?;
+        let res = (|| {
             self.cond_ws();
-            if !self.eat(")") {
-                return self.err("expected `)' in conditional expression");
+            if self.peek_token() == "!" {
+                self.pos += 1;
+                return Ok(CondExpr::Not(Box::new(self.cond_not()?)));
             }
-            return Ok(e);
-        }
-        self.cond_primary()
+            if self.peek_byte() == Some(b'(') {
+                self.pos += 1;
+                let e = self.cond_or()?;
+                self.cond_ws();
+                if !self.eat(")") {
+                    return self.err("expected `)' in conditional expression");
+                }
+                return Ok(e);
+            }
+            self.cond_primary()
+        })();
+        self.leave();
+        res
     }
 
     fn cond_primary(&mut self) -> PR<CondExpr> {
@@ -1747,35 +1830,37 @@ impl Parser {
         if w.is_empty() {
             return self.unexpected();
         }
-        if let Some(s) = word_literal(&w) {
-            let cs: Vec<char> = s.chars().collect();
-            if cs.len() == 2 && cs[0] == '-' && "abcdefghknoprstuvwxzGLNOS".contains(cs[1]) {
+        if let Some(s) = word_literal_str(&w) {
+            let b = s.as_bytes();
+            if b.len() == 2 && b[0] == b'-' && b"abcdefghknoprstuvwxzGLNOS".contains(&b[1]) {
                 self.cond_ws();
                 if !self.starts("]]") {
                     let a = self.parse_word()?;
                     if a.is_empty() {
                         return self.unexpected();
                     }
-                    return Ok(CondExpr::Unary(s, a));
+                    return Ok(CondExpr::Unary(s.to_string(), a));
                 }
             }
         }
         self.cond_ws();
-        if self.starts("]]") || self.starts("&&") || self.starts("||") || self.peek() == Some(')') {
+        if self.starts("]]") || self.starts("&&") || self.starts("||") || self.peek_byte() == Some(b')') {
             return Ok(CondExpr::Word(w));
         }
-        let op = if self.peek() == Some('<') || self.peek() == Some('>') {
-            let c = self.peek().unwrap();
+        let op = if self.peek_byte() == Some(b'<') || self.peek_byte() == Some(b'>') {
+            let c = self.peek_byte().unwrap() as char;
             self.pos += 1;
             c.to_string()
         } else {
             let t = self.peek_token();
             const OPS: &[&str] = &["==", "=", "!=", "=~", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef"];
-            if !OPS.contains(&t.as_str()) {
-                return self.err(&format!("conditional binary operator expected, found `{}'", t));
+            if !OPS.contains(&t) {
+                let found = t.to_string();
+                return self.err(&format!("conditional binary operator expected, found `{}'", found));
             }
-            self.pos += t.chars().count();
-            t
+            let op_s = t.to_string();
+            self.pos += op_s.len();
+            op_s
         };
         self.cond_ws();
         if op == "=~" {
@@ -1801,6 +1886,36 @@ pub fn check_complete(src: &str, aliases: &Rc<HashMap<String, String>>) -> Resul
             Ok(None) => return Ok(()),
             Ok(Some(_)) => {}
             Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_nesting_returns_error_not_stack_overflow() {
+        let deep_subshell = "( ".repeat(300) + "true" + &" )".repeat(300);
+        let mut p = Parser::new(&deep_subshell);
+        assert!(p.parse_all().is_err());
+
+        let deep_if = "if true; then ".repeat(300) + "true" + &"; fi".repeat(300);
+        let mut p_if = Parser::new(&deep_if);
+        assert!(p_if.parse_all().is_err());
+
+        let deep_cond = "[[ ".to_string() + &"( ".repeat(300) + "a" + &" )".repeat(300) + " ]]";
+        let mut p2 = Parser::new(&deep_cond);
+        assert!(p2.parse_all().is_err());
+    }
+
+    #[test]
+    fn utf8_escapes_and_tokens_parse_cleanly() {
+        let mut p = Parser::new("echo 'héllo' \"wörld\" a\\é");
+        let cmd = p.parse_all().unwrap();
+        match cmd {
+            Cmd::List(items) => assert_eq!(items.len(), 1),
+            _ => panic!("expected list"),
         }
     }
 }

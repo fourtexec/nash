@@ -7,8 +7,19 @@ use crate::glob;
 use crate::parser::Parser;
 use crate::shell::{Flow, Shell, Val};
 use crate::sys;
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
+const MAX_BRACE_ITEMS: usize = 100_000;
+const MAX_BRACE_DEPTH: u32 = 64;
 
 type Field = Vec<(char, bool)>;
+
+enum IfsMode {
+    Default,
+    Empty,
+    Custom(Vec<char>),
+}
 
 /// Field builder: accumulates expansion results and performs IFS splitting.
 pub struct FB {
@@ -16,15 +27,31 @@ pub struct FB {
     cur: Field,
     active: bool,
     ws_delim: bool,
-    ifs: Vec<char>,
+    ifs: IfsMode,
     nosplit: bool,
 }
 
 impl FB {
     fn new(ifs: &str, nosplit: bool) -> FB {
-        FB { done: Vec::new(), cur: Vec::new(), active: false, ws_delim: false, ifs: ifs.chars().collect(), nosplit }
+        let mode = if nosplit || ifs.is_empty() {
+            IfsMode::Empty
+        } else if ifs == " \t\n" {
+            IfsMode::Default
+        } else {
+            IfsMode::Custom(ifs.chars().collect())
+        };
+        FB { done: Vec::new(), cur: Vec::new(), active: false, ws_delim: false, ifs: mode, nosplit }
+    }
+    #[inline]
+    fn is_ifs(&self, c: char) -> bool {
+        match &self.ifs {
+            IfsMode::Default => c == ' ' || c == '\t' || c == '\n',
+            IfsMode::Empty => false,
+            IfsMode::Custom(v) => v.contains(&c),
+        }
     }
     fn push_str(&mut self, s: &str, quoted: bool) {
+        self.cur.reserve(s.len());
         for c in s.chars() {
             self.cur.push((c, quoted));
         }
@@ -48,12 +75,12 @@ impl FB {
         }
     }
     fn split(&mut self, s: &str) {
-        if self.nosplit || self.ifs.is_empty() {
+        if self.nosplit || matches!(self.ifs, IfsMode::Empty) {
             self.push_str(s, false);
             return;
         }
         for c in s.chars() {
-            if self.ifs.contains(&c) {
+            if self.is_ifs(c) {
                 if c == ' ' || c == '\t' || c == '\n' {
                     if self.active {
                         self.brk();
@@ -111,8 +138,27 @@ fn needs_glob(f: &Field) -> bool {
     false
 }
 
+#[inline]
+fn str_needs_glob(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut prev = b' ';
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'*' || c == b'?' {
+            return true;
+        }
+        if c == b'[' && b[i + 1..].contains(&b']') {
+            return true;
+        }
+        if c == b'(' && matches!(prev, b'@' | b'+' | b'!') {
+            return true;
+        }
+        prev = c;
+    }
+    false
+}
+
 fn to_pattern(f: &Field) -> String {
-    let mut s = String::new();
+    let mut s = String::with_capacity(f.len());
     for (c, q) in f {
         if *q && matches!(c, '*' | '?' | '[' | ']' | '\\' | '(' | ')' | '|' | '!' | '+' | '@' | '^' | '-') {
             s.push('\\');
@@ -142,23 +188,31 @@ fn sequence(body: &[It]) -> Option<Vec<Vec<It>>> {
     if parts.len() < 2 || parts.len() > 3 {
         return None;
     }
-    let step = if parts.len() == 3 { parts[2].parse::<i64>().ok()?.abs().max(1) } else { 1 };
+    let step: i128 = if parts.len() == 3 {
+        let raw = parts[2].parse::<i128>().ok()?;
+        (raw.unsigned_abs().max(1)).min(i128::MAX as u128) as i128
+    } else {
+        1
+    };
     let mk = |v: Vec<String>| Some(v.into_iter().map(|x| x.chars().map(It::C).collect()).collect());
-    if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+    if let (Ok(a64), Ok(b64)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+        let a = a64 as i128;
+        let b = b64 as i128;
         let padded = |p: &str| {
             let d = p.trim_start_matches('-');
             d.len() > 1 && d.starts_with('0')
         };
         let width = if padded(parts[0]) || padded(parts[1]) { parts[0].len().max(parts[1].len()) } else { 0 };
-        if (a - b).abs() / step > 1_000_000 {
+        let count = (a - b).unsigned_abs() / (step as u128);
+        if count >= MAX_BRACE_ITEMS as u128 {
             return None;
         }
-        let mut v = Vec::new();
+        let mut v = Vec::with_capacity((count as usize) + 1);
         let mut x = a;
         loop {
             v.push(if width > 0 {
                 if x < 0 {
-                    format!("-{:0w$}", -x, w = width - 1)
+                    format!("-{:0w$}", x.unsigned_abs(), w = width.saturating_sub(1))
                 } else {
                     format!("{:0w$}", x, w = width)
                 }
@@ -181,7 +235,7 @@ fn sequence(body: &[It]) -> Option<Vec<Vec<It>>> {
     }
     let (ca, cb): (Vec<char>, Vec<char>) = (parts[0].chars().collect(), parts[1].chars().collect());
     if ca.len() == 1 && cb.len() == 1 && ca[0].is_ascii_alphabetic() && cb[0].is_ascii_alphabetic() {
-        let (a, b) = (ca[0] as i64, cb[0] as i64);
+        let (a, b) = (ca[0] as i128, cb[0] as i128);
         let mut v = Vec::new();
         let mut x = a;
         loop {
@@ -203,64 +257,85 @@ fn sequence(body: &[It]) -> Option<Vec<Vec<It>>> {
     None
 }
 
-fn expand_items(items: &[It]) -> Vec<Vec<It>> {
+fn expand_items_depth(items: &[It], depth: u32) -> Option<Vec<Vec<It>>> {
+    if depth >= MAX_BRACE_DEPTH {
+        return None;
+    }
     let mut i = 0;
     while i < items.len() {
         if matches!(items[i], It::C('{')) {
-            let mut depth = 0;
+            let mut bdepth = 0;
             let mut j = i + 1;
             let mut commas = Vec::new();
             let mut close = None;
             while j < items.len() {
                 match items[j] {
-                    It::C('{') => depth += 1,
+                    It::C('{') => bdepth += 1,
                     It::C('}') => {
-                        if depth == 0 {
+                        if bdepth == 0 {
                             close = Some(j);
                             break;
                         }
-                        depth -= 1;
+                        bdepth -= 1;
                     }
-                    It::C(',') if depth == 0 => commas.push(j),
+                    It::C(',') if bdepth == 0 => commas.push(j),
                     _ => {}
                 }
                 j += 1;
             }
             if let Some(close) = close {
                 let alts: Option<Vec<Vec<It>>> = if !commas.is_empty() {
-                    let mut v = Vec::new();
+                    let mut out_alts = Vec::new();
                     let mut st = i + 1;
                     for &c in &commas {
-                        v.push(items[st..c].to_vec());
+                        let sub = expand_items_depth(&items[st..c], depth + 1)?;
+                        if out_alts.len().saturating_add(sub.len()) > MAX_BRACE_ITEMS {
+                            return None;
+                        }
+                        out_alts.extend(sub);
                         st = c + 1;
                     }
-                    v.push(items[st..close].to_vec());
-                    Some(v.into_iter().flat_map(|a| expand_items(&a)).collect())
+                    let sub = expand_items_depth(&items[st..close], depth + 1)?;
+                    if out_alts.len().saturating_add(sub.len()) > MAX_BRACE_ITEMS {
+                        return None;
+                    }
+                    out_alts.extend(sub);
+                    Some(out_alts)
                 } else {
                     sequence(&items[i + 1..close])
                 };
                 if let Some(alts) = alts {
-                    let suffixes = expand_items(&items[close + 1..]);
-                    let mut out = Vec::new();
+                    let suffixes = expand_items_depth(&items[close + 1..], depth + 1)?;
+                    let total = alts.len().saturating_mul(suffixes.len());
+                    if total > MAX_BRACE_ITEMS {
+                        return None;
+                    }
+                    let mut out = Vec::with_capacity(total);
                     for a in &alts {
                         for s in &suffixes {
-                            let mut v = items[..i].to_vec();
+                            let mut v = Vec::with_capacity(i + a.len() + s.len());
+                            v.extend_from_slice(&items[..i]);
                             v.extend(a.iter().cloned());
                             v.extend(s.iter().cloned());
                             out.push(v);
                         }
                     }
-                    return out;
+                    return Some(out);
                 }
             }
         }
         i += 1;
     }
-    vec![items.to_vec()]
+    Some(vec![items.to_vec()])
+}
+
+#[inline]
+fn has_brace(w: &Word) -> bool {
+    w.iter().any(|p| matches!(p, WordPart::Lit(s) if s.contains('{')))
 }
 
 pub fn brace_expand(w: &Word) -> Vec<Word> {
-    if !w.iter().any(|p| matches!(p, WordPart::Lit(s) if s.contains('{'))) {
+    if !has_brace(w) {
         return vec![w.clone()];
     }
     let mut items = Vec::new();
@@ -270,7 +345,10 @@ pub fn brace_expand(w: &Word) -> Vec<Word> {
             o => items.push(It::P(o.clone())),
         }
     }
-    expand_items(&items)
+    let Some(expanded) = expand_items_depth(&items, 0) else {
+        return vec![w.clone()];
+    };
+    expanded
         .into_iter()
         .map(|its| {
             let mut w: Word = Vec::new();
@@ -322,6 +400,14 @@ fn is_at_expansion(p: &WordPart) -> bool {
     }
 }
 
+#[inline]
+fn is_special_name(name: &str) -> bool {
+    matches!(
+        name.as_bytes().first(),
+        Some(b'?' | b'#' | b'$' | b'!' | b'-' | b'@' | b'*' | b'0'..=b'9')
+    )
+}
+
 impl arith::Env for Shell {
     fn get(&mut self, name: &str, idx: Option<&str>) -> Option<String> {
         match idx {
@@ -329,10 +415,22 @@ impl arith::Env for Shell {
             Some(i) => self.get_elem(name, i).ok().flatten(),
         }
     }
+    fn get_fast(&mut self, name: &str, idx: Option<&str>) -> Option<Cow<'_, str>> {
+        match idx {
+            None => self.get_cow(name),
+            Some(i) => self.get_elem(name, i).ok().flatten().map(Cow::Owned),
+        }
+    }
     fn set(&mut self, name: &str, idx: Option<&str>, val: String) -> Result<(), String> {
         match idx {
             None => self.set_str(name, val),
             Some(i) => self.set_elem(name, i, val, false).map_err(|_| format!("{}: bad array subscript", name)),
+        }
+    }
+    fn set_num(&mut self, name: &str, idx: Option<&str>, val: Num) -> Result<(), String> {
+        match (idx, val) {
+            (None, Num::I(n)) => self.set_i64(name, n),
+            _ => <Self as arith::Env>::set(self, name, idx, val.fmt()),
         }
     }
     fn strict_arith(&self) -> bool {
@@ -350,8 +448,13 @@ impl Shell {
     }
 
     pub fn arith(&mut self, expr: &str) -> Result<Num, Flow> {
-        let s = self.expand_string(expr)?;
-        match arith::eval(&s, self) {
+        let res = if !expr.contains(['$', '`', '\\']) {
+            arith::eval(expr, self)
+        } else {
+            let s = self.expand_string(expr)?;
+            arith::eval(&s, self)
+        };
+        match res {
             Ok(n) => Ok(n),
             Err(e) => {
                 sherr!("{}", e);
@@ -372,13 +475,13 @@ impl Shell {
             Ok(p) => p,
             Err(e) => return self.fail(e.msg),
         };
-        let mut fb = FB::new("", true);
-        self.expand_parts(&parts, true, false, &mut fb)?;
-        Ok(fb.into_string())
+        let mut out = String::with_capacity(s.len());
+        self.expand_parts_str(&parts, &mut out)?;
+        Ok(out)
     }
 
     pub fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>, Flow> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(words.len());
         for w in words {
             self.expand_word_into(w, &mut out)?;
         }
@@ -386,9 +489,84 @@ impl Shell {
     }
 
     pub fn expand_word_into(&mut self, w: &Word, out: &mut Vec<String>) -> Result<(), Flow> {
-        let ifs = self.ifs();
-        for w in &brace_expand(w) {
-            let mut fb = FB::new(&ifs, false);
+        match w.as_slice() {
+            [] => return Ok(()),
+            [WordPart::Lit(s)] => {
+                if !s.contains('{') {
+                    if self.opts.noglob || !str_needs_glob(s) {
+                        out.push(s.clone());
+                        return Ok(());
+                    }
+                    let ms = glob::glob(s, self.opts.dotglob);
+                    if !ms.is_empty() {
+                        out.extend(ms);
+                    } else if !self.opts.nullglob {
+                        out.push(s.clone());
+                    }
+                    return Ok(());
+                }
+            }
+            [WordPart::Quoted(s)] => {
+                out.push(s.clone());
+                return Ok(());
+            }
+            [WordPart::DQuote(inner)] if !inner.iter().any(is_at_expansion) => {
+                let mut s = String::new();
+                self.expand_parts_str(inner, &mut s)?;
+                out.push(s);
+                return Ok(());
+            }
+            [WordPart::Param(pe)]
+                if !pe.indirect
+                    && pe.index.is_none()
+                    && matches!(pe.op, ParamOp::Plain)
+                    && !is_special_name(&pe.name) =>
+            {
+                let default_ifs = self.ifs_str() == " \t\n";
+                if default_ifs {
+                    let val = match self.get_cow(&pe.name) {
+                        Some(v) => v.into_owned(),
+                        None => {
+                            if self.opts.nounset {
+                                return self.fail(format!("{}: unbound variable", pe.name));
+                            }
+                            return Ok(());
+                        }
+                    };
+                    let noglob = self.opts.noglob;
+                    let dotglob = self.opts.dotglob;
+                    let nullglob = self.opts.nullglob;
+                    for tok in val.split(|c: char| c == ' ' || c == '\t' || c == '\n') {
+                        if tok.is_empty() {
+                            continue;
+                        }
+                        if !noglob && str_needs_glob(tok) {
+                            let ms = glob::glob(tok, dotglob);
+                            if !ms.is_empty() {
+                                out.extend(ms);
+                                continue;
+                            }
+                            if nullglob {
+                                continue;
+                            }
+                        }
+                        out.push(tok.to_string());
+                    }
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+
+        let expanded;
+        let words_slice: &[Word] = if has_brace(w) {
+            expanded = brace_expand(w);
+            &expanded
+        } else {
+            std::slice::from_ref(w)
+        };
+        for w in words_slice {
+            let mut fb = FB::new(self.ifs_str(), false);
             self.expand_parts(w, false, false, &mut fb)?;
             for f in fb.finish() {
                 if !self.opts.noglob && needs_glob(&f) {
@@ -401,7 +579,11 @@ impl Shell {
                         continue;
                     }
                 }
-                out.push(f.iter().map(|(c, _)| *c).collect());
+                let mut s = String::with_capacity(f.len());
+                for (c, _) in f {
+                    s.push(c);
+                }
+                out.push(s);
             }
         }
         Ok(())
@@ -409,13 +591,66 @@ impl Shell {
 
     /// Expand without field splitting or globbing (assignments, redirections, case).
     pub fn expand_word_str(&mut self, w: &Word) -> Result<String, Flow> {
-        let mut fb = FB::new("", true);
-        self.expand_parts(w, false, false, &mut fb)?;
-        Ok(fb.into_string())
+        match w.as_slice() {
+            [] => Ok(String::new()),
+            [WordPart::Lit(s)] | [WordPart::Quoted(s)] => Ok(s.clone()),
+            _ => {
+                let mut out = String::new();
+                self.expand_parts_str(w, &mut out)?;
+                Ok(out)
+            }
+        }
+    }
+
+    /// Fast direct-to-String expansion without building intermediate `Field` buffers.
+    fn expand_parts_str(&mut self, parts: &[WordPart], out: &mut String) -> Result<(), Flow> {
+        for p in parts {
+            match p {
+                WordPart::Lit(s) | WordPart::Quoted(s) => out.push_str(s),
+                WordPart::DQuote(inner) => self.expand_parts_str(inner, out)?,
+                WordPart::Tilde(u) => {
+                    let t = self.expand_tilde(u);
+                    out.push_str(&t);
+                }
+                WordPart::Arith(raw) => match self.arith(raw)? {
+                    Num::I(i) => {
+                        let _ = write!(out, "{}", i);
+                    }
+                    n => out.push_str(&n.fmt()),
+                },
+                WordPart::CmdSubst(cmd) => {
+                    let v = self.cmd_subst(cmd)?;
+                    out.push_str(&v);
+                }
+                WordPart::ProcSubst(input, cmd) => {
+                    let path = self.proc_subst(*input, cmd)?;
+                    out.push_str(&path);
+                }
+                WordPart::Param(pe) => {
+                    if !pe.indirect && pe.index.is_none() && matches!(pe.op, ParamOp::Plain) && !is_special_name(&pe.name) {
+                        let nounset = self.opts.nounset;
+                        match self.get_cow(&pe.name) {
+                            Some(s) => out.push_str(&s),
+                            None if nounset => return self.fail(format!("{}: unbound variable", pe.name)),
+                            None => {}
+                        }
+                    } else {
+                        let mut fb = FB::new("", true);
+                        self.expand_param(pe, true, &mut fb)?;
+                        out.push_str(&fb.into_string());
+                    }
+                }
+                WordPart::Assign(_) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Expand to a glob pattern in which quoted characters are escaped.
     pub fn expand_pattern(&mut self, w: &Word) -> Result<String, Flow> {
+        if let [WordPart::Lit(s)] = w.as_slice() {
+            return Ok(s.clone());
+        }
         let mut fb = FB::new("", true);
         self.expand_parts(w, false, false, &mut fb)?;
         Ok(fb.into_pattern())
@@ -711,8 +946,7 @@ impl Shell {
             }
             PV::List(v, at) => {
                 if quoted && !at {
-                    let ifs = self.ifs();
-                    let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                    let sep = self.ifs_str().chars().next().map(|c| c.to_string()).unwrap_or_default();
                     fb.push_str(&v.join(&sep), true);
                 } else {
                     for (i, e) in v.iter().enumerate() {
@@ -731,7 +965,7 @@ impl Shell {
     }
 
     fn expand_param(&mut self, p: &ParamExp, quoted: bool, fb: &mut FB) -> Result<(), Flow> {
-        let (name, index): (String, Option<String>) = if p.indirect {
+        let (name, index): (Cow<'_, str>, Option<Cow<'_, str>>) = if p.indirect {
             let target = match self.param_value(&p.name, p.index.as_deref())? {
                 PV::Str(s) => s,
                 _ => String::new(),
@@ -740,11 +974,14 @@ impl Shell {
                 return Ok(());
             }
             match target.find('[') {
-                Some(i) if target.ends_with(']') => (target[..i].to_string(), Some(target[i + 1..target.len() - 1].to_string())),
-                _ => (target, None),
+                Some(i) if target.ends_with(']') => (
+                    Cow::Owned(target[..i].to_string()),
+                    Some(Cow::Owned(target[i + 1..target.len() - 1].to_string())),
+                ),
+                _ => (Cow::Owned(target), None),
             }
         } else {
-            (p.name.clone(), p.index.clone())
+            (Cow::Borrowed(&p.name), p.index.as_deref().map(Cow::Borrowed))
         };
         if let ParamOp::Keys = p.op {
             let keys = match self.var(&name).map(|v| &v.val) {
@@ -776,7 +1013,7 @@ impl Shell {
             ParamOp::Assign(colon, w) => {
                 if is_unset || (*colon && is_null) {
                     let s = self.expand_word_str(w)?;
-                    match &index {
+                    match index.as_deref() {
                         Some(i) => self.set_elem(&name, i, s.clone(), false)?,
                         None => {
                             if let Err(e) = self.set_str(&name, s.clone()) {
@@ -844,7 +1081,7 @@ impl Shell {
                 let range = |n: usize, mut o: i64| -> (usize, usize) {
                     let n = n as i64;
                     if o < 0 {
-                        o += n;
+                        o = o.saturating_add(n);
                         if o < 0 {
                             return (0, 0);
                         }
@@ -852,8 +1089,8 @@ impl Shell {
                     let o = o.min(n);
                     let end = match l {
                         None => n,
-                        Some(l) if l < 0 => (n + l).max(o),
-                        Some(l) => (o + l).min(n),
+                        Some(l) if l < 0 => n.saturating_add(l).max(o),
+                        Some(l) => o.saturating_add(l).min(n),
                     };
                     (o as usize, end as usize)
                 };
@@ -1047,5 +1284,28 @@ impl Shell {
             Ok(()) => Ok(()),
             Err(e) => self.fail(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brace_overflow_and_explosion_safety() {
+        // i64::MIN range must not panic on negation or subtraction.
+        let w = vec![WordPart::Lit("{-9223372036854775808..0}".into())];
+        let out = brace_expand(&w);
+        assert_eq!(out.len(), 1);
+
+        // Zero-padded i64::MIN small range must not panic.
+        let w2 = vec![WordPart::Lit("{-9223372036854775808..-9223372036854775807}".into())];
+        let out2 = brace_expand(&w2);
+        assert_eq!(out2.len(), 2);
+
+        // Cartesian product bomb (2^25 = 33M) must bail out safely without OOM.
+        let bomb = vec![WordPart::Lit("{a,b}".repeat(25))];
+        let out_bomb = brace_expand(&bomb);
+        assert_eq!(out_bomb.len(), 1);
     }
 }

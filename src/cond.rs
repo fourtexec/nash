@@ -9,8 +9,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 const BINOPS: &[&str] = &["=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef", "=~"];
 
 fn is_unop(s: &str) -> bool {
-    let cs: Vec<char> = s.chars().collect();
-    cs.len() == 2 && cs[0] == '-' && "abcdefghknoprstuvwxzGLNOS".contains(cs[1])
+    let b = s.as_bytes();
+    b.len() == 2 && b[0] == b'-' && b"abcdefghknoprstuvwxzGLNOS".contains(&b[1])
 }
 
 pub fn regex_match(text: &str, pat: &str) -> Result<Option<Vec<String>>, String> {
@@ -21,7 +21,7 @@ pub fn regex_match(text: &str, pat: &str) -> Result<Option<Vec<String>>, String>
         if libc::regcomp(&mut re, cpat.as_ptr(), libc::REG_EXTENDED) != 0 {
             return Err(format!("invalid regular expression: {}", pat));
         }
-        let n = pat.matches('(').count() + 1;
+        let n = pat.bytes().filter(|&b| b == b'(').count().min(256) + 1;
         let mut m: Vec<libc::regmatch_t> = vec![std::mem::zeroed(); n];
         let r = libc::regexec(&re, ctext.as_ptr(), n, m.as_mut_ptr(), 0);
         libc::regfree(&mut re);
@@ -32,7 +32,7 @@ pub fn regex_match(text: &str, pat: &str) -> Result<Option<Vec<String>>, String>
         Ok(Some(
             m.iter()
                 .map(|g| {
-                    if g.rm_so >= 0 {
+                    if g.rm_so >= 0 && g.rm_eo >= g.rm_so && (g.rm_eo as usize) <= bytes.len() {
                         String::from_utf8_lossy(&bytes[g.rm_so as usize..g.rm_eo as usize]).into_owned()
                     } else {
                         String::new()

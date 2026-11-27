@@ -150,14 +150,11 @@ pub enum Cmd {
     Redirected(Box<Cmd>, Vec<Redir>),
 }
 
-/// If the word consists only of unquoted literal text, return it.
-pub fn word_literal(w: &Word) -> Option<String> {
-    let mut s = String::new();
-    for p in w {
-        match p {
-            WordPart::Lit(l) => s.push_str(l),
-            _ => return None,
-        }
+/// Zero-allocation fast path: if the word is a single unquoted literal part, borrow it.
+#[inline]
+pub fn word_literal_str(w: &Word) -> Option<&str> {
+    match w.as_slice() {
+        [WordPart::Lit(s)] => Some(s.as_str()),
+        _ => None,
     }
-    Some(s)
 }
