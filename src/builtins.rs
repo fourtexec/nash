@@ -1390,6 +1390,7 @@ impl Shell {
                     out!("{}\n", newpwd);
                 }
                 if self.interactive {
+                    crate::prompt::report_cwd(self);
                     self.z_add(&newpwd);
                     self.save_last_dir();
                     if self.find_command("zoxide").is_some() {

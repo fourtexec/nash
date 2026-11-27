@@ -155,6 +155,7 @@ fn interactive_loop(sh: &mut Shell) -> R {
         call_hook(sh, "precmd", &[]);
         let prompt = pcache.render(sh, &["PS1"], prompt::DEFAULT_PS1);
         let rprompt = rcache.render(sh, &["RPROMPT", "RPS1"], "");
+        prompt::report_cwd(sh);
         if sh.job_control {
             unsafe {
                 let mut t: libc::termios = std::mem::zeroed();

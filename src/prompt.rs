@@ -13,23 +13,153 @@ pub fn char_width(c: char) -> usize {
     if u < 0x20 || (0x7f..0xa0).contains(&u) {
         return 0;
     }
-    if (0x300..=0x36f).contains(&u) || (0x200b..=0x200f).contains(&u) || (0xfe00..=0xfe0f).contains(&u) {
+    // Zero-width format characters, combining marks, variation selectors, and Hangul Jamo vowels/finals.
+    if u == 0x00ad
+        || (0x0300..=0x036f).contains(&u)
+        || (0x0483..=0x0489).contains(&u)
+        || (0x0591..=0x05bd).contains(&u)
+        || u == 0x05bf
+        || (0x05c1..=0x05c2).contains(&u)
+        || (0x05c4..=0x05c5).contains(&u)
+        || u == 0x05c7
+        || (0x0610..=0x061a).contains(&u)
+        || (0x064b..=0x065f).contains(&u)
+        || u == 0x0670
+        || (0x06d6..=0x06dc).contains(&u)
+        || (0x06df..=0x06e4).contains(&u)
+        || (0x06e7..=0x06e8).contains(&u)
+        || (0x06ea..=0x06ed).contains(&u)
+        || (0x0730..=0x074a).contains(&u)
+        || (0x0901..=0x0902).contains(&u)
+        || (0x093c..=0x093c).contains(&u)
+        || (0x0941..=0x0948).contains(&u)
+        || u == 0x094d
+        || (0x0951..=0x0957).contains(&u)
+        || (0x0e31..=0x0e31).contains(&u)
+        || (0x0e34..=0x0e3a).contains(&u)
+        || (0x0e47..=0x0e4e).contains(&u)
+        || (0x1160..=0x11ff).contains(&u)
+        || (0x1ab0..=0x1aff).contains(&u)
+        || (0x1dc0..=0x1dff).contains(&u)
+        || (0x200b..=0x200f).contains(&u)
+        || (0x202a..=0x202e).contains(&u)
+        || (0x2060..=0x206f).contains(&u)
+        || (0x20d0..=0x20ff).contains(&u)
+        || (0xfe00..=0xfe0f).contains(&u)
+        || (0xfe20..=0xfe2f).contains(&u)
+        || u == 0xfeff
+        || (0xe0100..=0xe01ef).contains(&u)
+    {
         return 0;
     }
+    // East Asian Wide/Fullwidth and wide graphic symbols.
     if (0x1100..=0x115f).contains(&u)
-        || (0x2e80..=0xa4cf).contains(&u)
+        || (0x231a..=0x231b).contains(&u)
+        || (0x2329..=0x232a).contains(&u)
+        || (0x23e9..=0x23ec).contains(&u)
+        || u == 0x23f0
+        || u == 0x23f3
+        || (0x25fd..=0x25fe).contains(&u)
+        || (0x2614..=0x2615).contains(&u)
+        || (0x2648..=0x2653).contains(&u)
+        || u == 0x267f
+        || u == 0x2693
+        || u == 0x26a1
+        || (0x26aa..=0x26ab).contains(&u)
+        || (0x26bd..=0x26be).contains(&u)
+        || (0x26c4..=0x26c5).contains(&u)
+        || u == 0x26ce
+        || u == 0x26d4
+        || u == 0x26ea
+        || (0x26f2..=0x26f3).contains(&u)
+        || u == 0x26f5
+        || u == 0x26fa
+        || u == 0x26fd
+        || u == 0x2705
+        || (0x270a..=0x270b).contains(&u)
+        || u == 0x2728
+        || u == 0x274c
+        || u == 0x274e
+        || (0x2753..=0x2755).contains(&u)
+        || u == 0x2757
+        || (0x2795..=0x2797).contains(&u)
+        || u == 0x27b0
+        || u == 0x27bf
+        || (0x2b1b..=0x2b1c).contains(&u)
+        || u == 0x2b50
+        || u == 0x2b55
+        || (0x2e80..=0x303e).contains(&u)
+        || (0x3041..=0xa4cf).contains(&u)
+        || (0xa960..=0xa97c).contains(&u)
         || (0xac00..=0xd7a3).contains(&u)
         || (0xf900..=0xfaff).contains(&u)
-        || (0xfe30..=0xfe4f).contains(&u)
-        || (0xff00..=0xff60).contains(&u)
+        || (0xfe10..=0xfe19).contains(&u)
+        || (0xfe30..=0xfe6b).contains(&u)
+        || (0xff01..=0xff60).contains(&u)
         || (0xffe0..=0xffe6).contains(&u)
+        || u == 0x1f004
+        || u == 0x1f0cf
+        || u == 0x1f18e
+        || (0x1f191..=0x1f19a).contains(&u)
+        || (0x1f200..=0x1f251).contains(&u)
         || (0x1f300..=0x1f64f).contains(&u)
+        || (0x1f680..=0x1f6ff).contains(&u)
         || (0x1f900..=0x1f9ff).contains(&u)
+        || (0x1fa70..=0x1faff).contains(&u)
         || (0x20000..=0x3fffd).contains(&u)
     {
         return 2;
     }
     1
+}
+
+/// Skip an ANSI escape sequence starting at `cs[i] == '\x1b'`, returning the
+/// index immediately following the sequence.
+fn skip_ansi_escape(cs: &[char], mut i: usize) -> usize {
+    i += 1;
+    match cs.get(i) {
+        Some('[') => {
+            // CSI: ESC [ params intermediate final (0x40..=0x7e)
+            i += 1;
+            while i < cs.len() && !('\x40'..='\x7e').contains(&cs[i]) {
+                i += 1;
+            }
+            (i + 1).min(cs.len())
+        }
+        Some(']') => {
+            // OSC: terminated by BEL (\x07) or ST (ESC \)
+            i += 1;
+            while i < cs.len()
+                && cs[i] != '\x07'
+                && !(cs[i] == '\x1b' && cs.get(i + 1) == Some(&'\\'))
+            {
+                i += 1;
+            }
+            if cs.get(i) == Some(&'\x1b') {
+                (i + 2).min(cs.len())
+            } else {
+                (i + 1).min(cs.len())
+            }
+        }
+        Some('P') | Some('X') | Some('^') | Some('_') => {
+            // DCS / SOS / PM / APC: terminated by ST (ESC \)
+            i += 1;
+            while i < cs.len() && !(cs[i] == '\x1b' && cs.get(i + 1) == Some(&'\\')) {
+                i += 1;
+            }
+            (i + 2).min(cs.len())
+        }
+        Some(&c) if ('\x20'..='\x2f').contains(&c) => {
+            // 3+ byte sequences such as charset designation (ESC ( B)
+            i += 1;
+            while i < cs.len() && ('\x20'..='\x2f').contains(&cs[i]) {
+                i += 1;
+            }
+            (i + 1).min(cs.len())
+        }
+        Some(_) => i + 1,
+        None => i,
+    }
 }
 
 /// Display width of a string, ignoring ANSI escape sequences.
@@ -39,29 +169,127 @@ pub fn visible_width(s: &str) -> usize {
     let mut i = 0;
     while i < cs.len() {
         if cs[i] == '\x1b' {
-            i += 1;
-            match cs.get(i) {
-                Some('[') => {
-                    i += 1;
-                    while i < cs.len() && !('\x40'..='\x7e').contains(&cs[i]) {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                Some(']') => {
-                    while i < cs.len() && cs[i] != '\x07' && !(cs[i] == '\x1b' && cs.get(i + 1) == Some(&'\\')) {
-                        i += 1;
-                    }
-                    i += if cs.get(i) == Some(&'\x1b') { 2 } else { 1 };
-                }
-                _ => i += 1,
-            }
+            i = skip_ansi_escape(&cs, i);
             continue;
         }
         w += char_width(cs[i]);
         i += 1;
     }
     w
+}
+
+/// Cursor position after writing a prompt string to a terminal of width `cols`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptPos {
+    pub row: usize,
+    pub col: usize,
+    /// True when the last printable character reached the right margin and a
+    /// VT100/xterm terminal is holding a deferred wrap until the next character.
+    pub pending_wrap: bool,
+}
+
+/// Simulate terminal cell wrapping for `s` on a screen of `cols` columns.
+/// Accounts for ANSI escapes, wide characters crossing the right margin, tabs,
+/// carriage returns, newlines, and deferred wrap (`xenl`).
+pub fn measure_prompt(s: &str, cols: usize) -> PromptPos {
+    let cols = cols.max(1);
+    let cs: Vec<char> = s.chars().collect();
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut pending_wrap = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\x1b' {
+            i = skip_ansi_escape(&cs, i);
+            continue;
+        }
+        i += 1;
+        match c {
+            '\r' => {
+                col = 0;
+                pending_wrap = false;
+            }
+            '\n' => {
+                row += 1;
+                pending_wrap = false;
+            }
+            '\t' => {
+                pending_wrap = false;
+                col = ((col / 8) + 1) * 8;
+                if col >= cols {
+                    col = cols - 1;
+                }
+            }
+            _ => {
+                let w = char_width(c);
+                if w == 0 {
+                    continue;
+                }
+                if pending_wrap {
+                    row += 1;
+                    col = 0;
+                    pending_wrap = false;
+                }
+                if col > 0 && col + w > cols {
+                    row += 1;
+                    col = 0;
+                }
+                if col + w >= cols {
+                    col = cols - 1;
+                    pending_wrap = true;
+                } else {
+                    col += w;
+                }
+            }
+        }
+    }
+    PromptPos { row, col, pending_wrap }
+}
+
+/// Percent-encode a string for a `file://` URI in an OSC 7 sequence.
+fn osc7_encode(s: &str, keep_slash: bool, out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in s.as_bytes() {
+        let safe = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && b == b'/');
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+}
+
+/// Build an OSC 7 sequence (`\x1b]7;file://<host><encoded-path>\x07`) so
+/// terminal emulators track the shell's current working directory.
+pub fn osc7_cwd(host: &str, cwd: &str) -> String {
+    let mut out = String::with_capacity(16 + host.len() + cwd.len());
+    out.push_str("\x1b]7;file://");
+    osc7_encode(host, false, &mut out);
+    if !cwd.starts_with('/') {
+        out.push('/');
+    }
+    osc7_encode(cwd, true, &mut out);
+    out.push('\x07');
+    out
+}
+
+/// Report the shell's current working directory to the terminal emulator via
+/// OSC 7 when running interactively on a terminal.
+pub fn report_cwd(sh: &mut Shell) {
+    if !sh.interactive || !sys::isatty(2) {
+        return;
+    }
+    if var_str(sh, "TERM") == Some("dumb") {
+        return;
+    }
+    let cwd = sh.cwd();
+    let seq = osc7_cwd(sh.hostname(), &cwd);
+    sys::write_fd(2, seq.as_bytes());
 }
 
 /// Find the git directory (the one holding `HEAD`) by walking up from `cwd`.
@@ -851,5 +1079,51 @@ mod tests {
         std::fs::write(base.join(".git/HEAD"), "0123456789abcdef0123456789abcdef01234567\n").unwrap();
         assert_eq!(git_branch(&mut sh, &cwd), Some("0123456"), "detached");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn measure_prompt_handles_wraps_wide_chars_and_escapes() {
+        // Exact right margin triggers deferred wrap.
+        let p = measure_prompt("1234567890", 10);
+        assert_eq!(p, PromptPos { row: 0, col: 9, pending_wrap: true });
+
+        // One char past margin wraps to row 1 col 1.
+        let p = measure_prompt("12345678901", 10);
+        assert_eq!(p, PromptPos { row: 1, col: 1, pending_wrap: false });
+
+        // ANSI CSI, OSC, and 3-byte charset escapes consume zero columns.
+        let s = "\x1b]7;file://host/tmp\x07\x1b(B\x1b[1;34m~/path\x1b[0m > ";
+        assert_eq!(visible_width(s), 9);
+        assert_eq!(measure_prompt(s, 40), PromptPos { row: 0, col: 9, pending_wrap: false });
+
+        // Wide char at col == cols - 1 wraps before the character.
+        let s = format!("{}a", "123456789\u{65e5}");
+        assert_eq!(measure_prompt(&s, 10), PromptPos { row: 1, col: 3, pending_wrap: false });
+
+        // Wide graphic symbol (U+1F680) has display width 2.
+        assert_eq!(char_width('\u{1f680}'), 2);
+        // Combining acute accent (U+0301) has display width 0.
+        assert_eq!(char_width('\u{0301}'), 0);
+    }
+
+    #[test]
+    fn osc7_cwd_encodes_uri_safely() {
+        assert_eq!(
+            osc7_cwd("workstation", "/home/user/project"),
+            "\x1b]7;file://workstation/home/user/project\x07"
+        );
+        assert_eq!(
+            osc7_cwd("host", "/tmp/my dir/100%#?name"),
+            "\x1b]7;file://host/tmp/my%20dir/100%25%23%3Fname\x07"
+        );
+        assert_eq!(
+            osc7_cwd("host", "/"),
+            "\x1b]7;file://host/\x07"
+        );
+        // UTF-8 multibyte path segments are percent-encoded byte-by-byte.
+        assert_eq!(
+            osc7_cwd("host", "/tmp/\u{043f}\u{0430}\u{043f}\u{043a}\u{0430}"),
+            "\x1b]7;file://host/tmp/%D0%BF%D0%B0%D0%BF%D0%BA%D0%B0\x07"
+        );
     }
 }

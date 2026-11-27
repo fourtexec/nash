@@ -222,11 +222,23 @@ pub fn decode_status(st: i32) -> WaitStatus {
 pub fn term_size() -> (usize, usize) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-            return (ws.ws_col as usize, ws.ws_row.max(1) as usize);
+        for fd in [2, 1, 0] {
+            if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return (ws.ws_col as usize, ws.ws_row.max(1) as usize);
+            }
         }
     }
-    (80, 24)
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(80);
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(24);
+    (cols, rows)
 }
 
 pub fn now_secs() -> i64 {

@@ -1,10 +1,12 @@
 //! The interactive line editor: syntax highlighting, history autosuggestions,
 //! menu completion, multi-line editing and incremental history search.
 
+use std::fmt::Write as _;
+
 use crate::highlight::{highlight, sgr, St};
 use crate::history::Entry;
 use crate::parser::RESERVED;
-use crate::prompt::{char_width, visible_width};
+use crate::prompt::{char_width, measure_prompt, visible_width};
 use crate::shell::Shell;
 use crate::sys;
 
@@ -79,7 +81,7 @@ impl Painter {
         } else {
             (c, char_width(c))
         };
-        if self.col + w > self.cols {
+        if self.col > 0 && self.col + w > self.cols {
             self.out.push_str("\r\n");
             self.row += 1;
             self.col = 0;
@@ -154,6 +156,11 @@ struct Editor<'a> {
     buf: Vec<char>,
     cur: usize,
     row: usize,
+    prompt_drawn: bool,
+    drawn_prompt: String,
+    drawn_cols: usize,
+    prompt_row: usize,
+    prompt_col: usize,
     suggestion: String,
     hist_idx: Option<usize>,
     hist_prefix: String,
@@ -380,7 +387,12 @@ impl<'a> Editor<'a> {
                     d.push(ch);
                     w += cw;
                 }
-                let padding = " ".repeat(colw - w);
+                let pad_len = if c + 1 < ncols && idx + 1 < n {
+                    colw.saturating_sub(w)
+                } else {
+                    0
+                };
+                let padding = " ".repeat(pad_len);
                 if Some(idx) == m.sel {
                     line.push_str(&format!("\x1b[7m{}\x1b[0m{}", d, padding));
                 } else if !it.color.is_empty() {
@@ -392,39 +404,95 @@ impl<'a> Editor<'a> {
             lines.push(line);
         }
         if nrows > max_rows {
-            lines.push(format!("\x1b[90m… {} items, Tab to cycle\x1b[0m", n));
+            let msg = format!("… {} items, Tab to cycle", n);
+            let limit = cols.saturating_sub(1);
+            let mut trunc = String::new();
+            let mut w = 0;
+            for ch in msg.chars() {
+                let cw = char_width(ch);
+                if w + cw > limit {
+                    break;
+                }
+                trunc.push(ch);
+                w += cw;
+            }
+            lines.push(format!("\x1b[90m{}\x1b[0m", trunc));
         }
         lines
     }
 
-    fn refresh(&mut self) {
-        let (cols, rows) = sys::term_size();
+    fn render_frame(&mut self, cols: usize, rows: usize) -> String {
+        let cols = cols.max(1);
         let mut p = Painter { out: String::new(), row: 0, col: 0, cols };
-        if self.row > 0 {
-            p.out.push_str(&format!("\x1b[{}A", self.row));
-        }
-        p.out.push_str("\r\x1b[J");
         let prompt = match &self.search {
-            Some((q, idx)) => format!("({}reverse-i-search)`{}': ", if idx.is_none() && !q.is_empty() { "failed " } else { "" }, q),
+            Some((q, idx)) => format!(
+                "({}reverse-i-search)`{}': ",
+                if idx.is_none() && !q.is_empty() { "failed " } else { "" },
+                q
+            ),
             None => self.prompt.clone(),
         };
-        p.out.push_str(&prompt);
-        // The prompt itself may wrap over several screen rows when it is longer
-        // than the terminal width.  Keep the painter in sync with the real
-        // cursor, otherwise `self.row` (the number of rows to move back up on
-        // the next refresh) misses the prompt's own wraps and every keystroke
-        // redraws the prompt one line further down.
-        let prompt_w = visible_width(&prompt);
-        p.row = prompt_w / cols;
-        p.col = prompt_w % cols;
-        if p.col == 0 && prompt_w > 0 {
-            // A terminal defers the wrap at the right margin until the next
-            // printable character, while Painter::put() wraps eagerly.  Force
-            // it now so subsequent bookkeeping matches.
-            p.out.push_str("\r\n");
+        let reuse_prompt = self.prompt_drawn
+            && self.drawn_cols == cols
+            && self.drawn_prompt == prompt;
+
+        if reuse_prompt {
+            // Keep the already-drawn prompt (including any wrapped folder-path
+            // rows) untouched on screen; only reposition to the end of the
+            // prompt and redraw the input buffer after it.
+            let up = self.row.saturating_sub(self.prompt_row);
+            if up > 0 {
+                let _ = write!(p.out, "\x1b[{}A", up);
+            }
+            p.out.push('\r');
+            if self.prompt_col > 0 {
+                let _ = write!(p.out, "\x1b[{}C", self.prompt_col);
+            }
+            p.out.push_str("\x1b[J\x1b[0m");
+            p.row = self.prompt_row;
+            p.col = self.prompt_col;
+        } else {
+            // Full redraw (initial paint, Ctrl-L, search prompt change, or
+            // terminal resize). When resizing, recompute the reflowed prompt
+            // row count under the new width so wrapped prompt rows are cleared.
+            let up = if self.prompt_drawn && self.drawn_cols != cols {
+                let reflowed = measure_prompt(&self.drawn_prompt, cols);
+                let reflowed_prompt_row = reflowed.row + usize::from(reflowed.pending_wrap);
+                let buf_rows = self.row.saturating_sub(self.prompt_row);
+                reflowed_prompt_row + buf_rows
+            } else {
+                self.row
+            };
+            if up > 0 {
+                let _ = write!(p.out, "\x1b[{}A", up);
+            }
+            p.out.push_str("\r\x1b[J");
+            p.out.push_str(&prompt);
+            let pos = measure_prompt(&prompt, cols);
+            if pos.pending_wrap {
+                // Terminals defer wrap at the right margin until the next
+                // printable character; force it now so bookkeeping matches.
+                p.out.push_str("\r\n");
+                p.row = pos.row + 1;
+                p.col = 0;
+            } else {
+                p.row = pos.row;
+                p.col = pos.col;
+            }
+            p.out.push_str("\x1b[0m");
+            self.prompt_drawn = true;
+            self.drawn_prompt = prompt;
+            self.drawn_cols = cols;
+            self.prompt_row = p.row;
+            self.prompt_col = p.col;
         }
-        let styles = if self.buf.len() < 5000 { highlight(self.sh, &self.buf) } else { vec![St::Plain; self.buf.len()] };
-        let mut cur_pos = (0, p.col);
+
+        let styles = if self.buf.len() < 5000 {
+            highlight(self.sh, &self.buf)
+        } else {
+            vec![St::Plain; self.buf.len()]
+        };
+        let mut cur_pos = (p.row, p.col);
         let mut last = St::Plain;
         for (i, &c) in self.buf.iter().enumerate() {
             if i == self.cur {
@@ -445,8 +513,21 @@ impl<'a> Editor<'a> {
         }
         if !self.suggestion.is_empty() && self.cur == self.buf.len() && self.menu.is_none() && self.search.is_none() {
             p.out.push_str("\x1b[90m");
-            let budget = (cols - p.col).saturating_sub(1) + cols;
-            for c in self.suggestion.chars().take(budget) {
+            let max_row = cur_pos.0 + 1;
+            for c in self.suggestion.chars() {
+                if c == '\n' && p.row >= max_row {
+                    break;
+                }
+                let w = if c == '\n' {
+                    0
+                } else if c == '\t' || c.is_control() {
+                    1
+                } else {
+                    char_width(c)
+                };
+                if c != '\n' && p.row >= max_row && p.col + w >= cols {
+                    break;
+                }
                 p.put(c);
             }
             p.out.push_str("\x1b[0m");
@@ -454,7 +535,7 @@ impl<'a> Editor<'a> {
         if !self.rprompt.is_empty() && p.row == 0 && self.menu.is_none() && self.search.is_none() {
             let w = visible_width(&self.rprompt);
             if p.col + w + 2 < cols {
-                p.out.push_str(&format!("\x1b[{}G{}\x1b[0m", cols - w, self.rprompt));
+                let _ = write!(p.out, "\x1b[{}G{}\x1b[0m", cols - w, self.rprompt);
             }
         }
         for line in self.menu_lines(cols, rows) {
@@ -463,14 +544,20 @@ impl<'a> Editor<'a> {
             p.row += 1;
         }
         if p.row > cur_pos.0 {
-            p.out.push_str(&format!("\x1b[{}A", p.row - cur_pos.0));
+            let _ = write!(p.out, "\x1b[{}A", p.row - cur_pos.0);
         }
         p.out.push('\r');
         if cur_pos.1 > 0 {
-            p.out.push_str(&format!("\x1b[{}C", cur_pos.1));
+            let _ = write!(p.out, "\x1b[{}C", cur_pos.1);
         }
         self.row = cur_pos.0;
-        sys::write_fd(2, p.out.as_bytes());
+        p.out
+    }
+
+    fn refresh(&mut self) {
+        let (cols, rows) = sys::term_size();
+        let out = self.render_frame(cols, rows);
+        sys::write_fd(2, out.as_bytes());
     }
 
     fn edited(&mut self) {
@@ -1247,6 +1334,7 @@ impl<'a> Editor<'a> {
                 Key::Ctrl('l') => {
                     sys::write_fd(2, format!("\x1b[H\x1b[2J{}", self.head).as_bytes());
                     self.row = 0;
+                    self.prompt_drawn = false;
                 }
                 Key::Ctrl('r') => {
                     self.saved = self.buf.clone();
@@ -1340,6 +1428,11 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
         buf: Vec::new(),
         cur: 0,
         row: 0,
+        prompt_drawn: false,
+        drawn_prompt: String::new(),
+        drawn_cols: 0,
+        prompt_row: 0,
+        prompt_col: 0,
         suggestion: String::new(),
         hist_idx: None,
         hist_prefix: String::new(),
@@ -1395,6 +1488,86 @@ mod tests {
         assert_eq!(h.older(&e), Some(2));
         assert_eq!(h.older(&e), Some(1));
         assert_eq!(h.older(&e), None);
+    }
+
+    fn make_editor<'a>(sh: &'a mut Shell, prompt: &str) -> Editor<'a> {
+        Editor {
+            sh,
+            prompt: prompt.to_string(),
+            head: String::new(),
+            rprompt: String::new(),
+            buf: Vec::new(),
+            cur: 0,
+            row: 0,
+            prompt_drawn: false,
+            drawn_prompt: String::new(),
+            drawn_cols: 0,
+            prompt_row: 0,
+            prompt_col: 0,
+            suggestion: String::new(),
+            hist_idx: None,
+            hist_prefix: String::new(),
+            hnav: HistNav::default(),
+            saved: Vec::new(),
+            menu: None,
+            kill: Vec::new(),
+            search: None,
+            cwd: "/".to_string(),
+            ls: crate::colors::LsColors::parse(""),
+        }
+    }
+
+    #[test]
+    fn long_wrapped_prompt_is_not_reprinted_per_keystroke() {
+        let mut sh = Shell::new();
+        let path = "~/very/long/folder/path/that/exceeds/the/terminal/width/considerably";
+        let prompt = format!("\x1b[1;34m{}\x1b[0m \x1b[32m>\x1b[0m ", path);
+        let mut ed = make_editor(&mut sh, &prompt);
+
+        // Initial render prints the full wrapped path once.
+        let first = ed.render_frame(40, 20);
+        assert!(first.contains(path));
+        assert_eq!(ed.prompt_row, 1);
+        assert_eq!(ed.prompt_col, 31);
+
+        // Typing characters reuses the drawn prompt and never re-emits the path.
+        for ch in ['e', 'c', 'h', 'o', ' ', 'h', 'i', '!', ' ', '1', '2', '3', '4', '5'] {
+            let mut tmp = [0u8; 4];
+            ed.insert_str(ch.encode_utf8(&mut tmp));
+            let frame = ed.render_frame(40, 20);
+            assert!(!frame.contains("very/long/folder"), "path should not be rewritten on keystroke '{}'", ch);
+        }
+
+        // Wrapping the command line past col 40 moves up only to prompt_row (never into row 0).
+        assert_eq!(ed.row, 2);
+        ed.insert_str("x");
+        let frame = ed.render_frame(40, 20);
+        assert!(frame.starts_with("\x1b[1A\r\x1b[31C\x1b[J"));
+        assert!(!frame.contains("very/long/folder"));
+
+        // Resizing to a narrower width triggers a clean full redraw.
+        let resized = ed.render_frame(30, 20);
+        assert!(resized.contains(path));
+        assert_eq!(ed.drawn_cols, 30);
+    }
+
+    #[test]
+    fn exact_width_prompt_forces_wrap_and_stays_untouched() {
+        let mut sh = Shell::new();
+        // 37 chars + " > " (3 chars) = 40 cols exact.
+        let path = "~/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let prompt = format!("\x1b[1;34m{}\x1b[0m \x1b[32m>\x1b[0m ", path);
+        let mut ed = make_editor(&mut sh, &prompt);
+
+        let first = ed.render_frame(40, 20);
+        assert!(first.contains(path));
+        assert_eq!(ed.prompt_row, 1);
+        assert_eq!(ed.prompt_col, 0);
+
+        ed.insert_str("a");
+        let next = ed.render_frame(40, 20);
+        assert!(!next.contains(path));
+        assert!(next.starts_with("\r\x1b[J"));
     }
 }
 
