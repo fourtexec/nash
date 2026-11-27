@@ -328,8 +328,7 @@ fn main() {
         let a = &args[i];
         match a.as_str() {
             "--logo" => {
-                let color = std::env::var_os("NO_COLOR").map(|v| v.is_empty()).unwrap_or(true);
-                out!("{}", logo::render(version(), logo::env_is_utf8(), color));
+                logo::print_cli(version());
                 return;
             }
             "--version" => {

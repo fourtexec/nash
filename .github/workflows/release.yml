@@ -40,9 +40,16 @@ jobs:
             case "$GITHUB_REF" in
               refs/tags/*) tag="${GITHUB_REF#refs/tags/}" ;;
               *)
-                # one higher than the newest devN tag; dev1 if there is none yet
-                last=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" 'refs/tags/dev*' | sed -n 's|.*refs/tags/dev\([0-9][0-9]*\)$|\1|p' | sort -n | tail -n 1)
-                tag="dev$(( ${last:-0} + 1 ))"
+                # Publish v1.0.1 on the next push to main if it does not exist yet,
+                # then continue publishing devN pre-releases as before.
+                has_v101=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" 'refs/tags/v1.0.1')
+                if [ -z "$has_v101" ]; then
+                  tag="v1.0.1"
+                else
+                  # one higher than the newest devN tag; dev1 if there is none yet
+                  last=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" 'refs/tags/dev*' | sed -n 's|.*refs/tags/dev\([0-9][0-9]*\)$|\1|p' | sort -n | tail -n 1)
+                  tag="dev$(( ${last:-0} + 1 ))"
+                fi
                 ;;
             esac
           fi
