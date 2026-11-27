@@ -12,8 +12,9 @@ mod exec;
 mod expand;
 mod glob;
 mod highlight;
-mod install;
 mod history;
+mod install;
+mod logo;
 mod parser;
 mod prompt;
 mod shell;
@@ -34,6 +35,7 @@ options:
   -s            read commands from standard input
   -e -u -x -f -C -a -v, -o name    set shell options (see `help')
   --norc        do not read ~/.nashrc
+  --logo        print the nash terminal logo and exit
   --version     print version and exit
   --help        print this help
 
@@ -144,6 +146,7 @@ fn interactive_loop(sh: &mut Shell) -> R {
     let mut warned_jobs = false;
     let mut pcache = prompt::PromptCache::new();
     let mut rcache = prompt::PromptCache::new();
+    logo::print_startup(sh);
     loop {
         sh.notify_jobs();
         sys::take_pending(libc::SIGINT);
@@ -324,6 +327,11 @@ fn main() {
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
+            "--logo" => {
+                let color = std::env::var_os("NO_COLOR").map(|v| v.is_empty()).unwrap_or(true);
+                out!("{}", logo::render(version(), logo::env_is_utf8(), color));
+                return;
+            }
             "--version" => {
                 out!("nash {}\n", version());
                 return;

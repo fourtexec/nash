@@ -7,17 +7,81 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
 const HELP: &str = "\
-usage: nash install [--prefix DIR] [--no-chsh]
+usage: nash install [--prefix DIR] [--no-chsh] [--no-logo]
 
 Installs nash as your main shell:
   1. copies the nash binary to DIR/bin (default /usr/local, or ~/.local
      when /usr/local/bin is not writable)
-  2. adds it to /etc/shells
-  3. makes it your login shell with chsh
+  2. adds the nash texted startup logo to ~/.bashrc
+  3. adds it to /etc/shells
+  4. makes it your login shell with chsh
 
   --prefix DIR   install into DIR/bin
-  --no-chsh      only install the binary, do not change the login shell
+  --no-chsh      only install the binary and ~/.bashrc hook, do not change the login shell
+  --no-logo      do not add the startup logo to ~/.bashrc
 ";
+
+const LOGO_START: &str = "# >>> nash logo >>>";
+const LOGO_END: &str = "# <<< nash logo <<<";
+
+/// Build the idempotent `.bashrc` snippet that prints the nash texted logo on
+/// interactive shell startup.
+fn bashrc_logo_block(nash_bin: &str) -> String {
+    let quoted = crate::expand::shell_quote(nash_bin);
+    format!(
+        "{start}\n\
+         case $- in\n\
+             *i*)\n\
+                 if [ \"${{NASH_NO_LOGO:-0}}\" != \"1\" ] && [ -x {bin} ]; then\n\
+                     {bin} --logo\n\
+                 fi\n\
+                 ;;\n\
+         esac\n\
+         {end}\n",
+        start = LOGO_START,
+        bin = quoted,
+        end = LOGO_END,
+    )
+}
+
+/// Remove any `# >>> marker >>>` ... `# <<< marker <<<` section from `content`.
+fn strip_managed_block(content: &str, start_marker: &str, end_marker: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut skip = false;
+    for line in content.lines() {
+        if line.trim() == start_marker {
+            skip = true;
+            continue;
+        }
+        if line.trim() == end_marker {
+            skip = false;
+            continue;
+        }
+        if skip {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Insert or update the nash startup logo block inside `<home>/.bashrc`.
+fn install_bashrc_logo(home: &str, nash_bin: &str) -> std::io::Result<String> {
+    let bashrc = format!("{}/.bashrc", home.trim_end_matches('/'));
+    let existing = std::fs::read_to_string(&bashrc).unwrap_or_default();
+    let cleaned = strip_managed_block(&existing, LOGO_START, LOGO_END);
+    let mut updated = cleaned;
+    if !updated.is_empty() && !updated.ends_with("\n\n") {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push('\n');
+    }
+    updated.push_str(&bashrc_logo_block(nash_bin));
+    std::fs::write(&bashrc, updated)?;
+    Ok(bashrc)
+}
 
 fn writable_dir(dir: &str) -> bool {
     sys::is_dir(dir) && sys::access(dir, libc::W_OK)
@@ -61,6 +125,7 @@ fn append_etc_shells_sudo(line: &str) -> bool {
 pub fn install(args: &[String]) -> i32 {
     let mut prefix: Option<String> = None;
     let mut chsh = true;
+    let mut add_logo = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -75,6 +140,7 @@ pub fn install(args: &[String]) -> i32 {
                 }
             }
             "--no-chsh" => chsh = false,
+            "--no-logo" => add_logo = false,
             "-h" | "--help" => {
                 out!("{}", HELP);
                 return 0;
@@ -143,6 +209,14 @@ pub fn install(args: &[String]) -> i32 {
     if !path.split(':').any(|d| d.trim_end_matches('/') == bindir) {
         out!("note: {} is not in your PATH; add it in ~/.profile:\n    export PATH=\"{}:$PATH\"\n", bindir, bindir);
     }
+    if add_logo {
+        match install_bashrc_logo(&home, &dest) {
+            Ok(rc) => {
+                out!("added nash startup logo to {}\n", rc);
+            }
+            Err(e) => err!("nash install: could not update ~/.bashrc: {}\n", e),
+        }
+    }
     if !chsh {
         return 0;
     }
@@ -191,26 +265,11 @@ pub fn install(args: &[String]) -> i32 {
 
 pub fn uninstall(_args: &[String]) -> i32 {
     let home = std::env::var("HOME").ok().unwrap_or_else(|| "/".to_string());
-    // Remove the PATH block added by the install script from common rc files.
+    // Remove managed nash blocks added to common rc files.
     for rc in [format!("{}/.profile", home), format!("{}/.bashrc", home), format!("{}/.zshrc", home), format!("{}/.nashrc", home)] {
         if let Ok(s) = std::fs::read_to_string(&rc) {
-            let mut out = String::new();
-            let mut skip = false;
-            for line in s.lines() {
-                if line.trim() == "# >>> nash >>>" {
-                    skip = true;
-                    continue;
-                }
-                if line.trim() == "# <<< nash <<<" {
-                    skip = false;
-                    continue;
-                }
-                if skip {
-                    continue;
-                }
-                out.push_str(line);
-                out.push('\n');
-            }
+            let out = strip_managed_block(&s, "# >>> nash >>>", "# <<< nash <<<");
+            let out = strip_managed_block(&out, LOGO_START, LOGO_END);
             let _ = std::fs::write(&rc, out);
         }
     }
@@ -255,5 +314,37 @@ mod tests {
         assert!(!is_safe_shell_path("/tmp/foo\n/bin/sh"));
         assert!(!is_safe_shell_path("/tmp/foo\0bar"));
         assert!(!is_safe_shell_path("/tmp/foo\rbar"));
+    }
+
+    #[test]
+    fn bashrc_logo_install_is_idempotent_and_removable() {
+        let base = std::env::temp_dir().join(format!("nash-bashrc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let home = base.to_str().unwrap();
+        let rc_path = base.join(".bashrc");
+        std::fs::write(&rc_path, "export FOO=bar\n").unwrap();
+
+        install_bashrc_logo(home, "/usr/local/bin/nash").unwrap();
+        let first = std::fs::read_to_string(&rc_path).unwrap();
+        assert!(first.contains("export FOO=bar"));
+        assert!(first.contains(LOGO_START));
+        assert!(first.contains("--logo"));
+        assert_eq!(first.matches(LOGO_START).count(), 1);
+
+        // Re-running with a new path updates in place without duplicating.
+        install_bashrc_logo(home, "/opt/my bin/nash").unwrap();
+        let second = std::fs::read_to_string(&rc_path).unwrap();
+        assert_eq!(second.matches(LOGO_START).count(), 1);
+        assert!(second.contains("'/opt/my bin/nash' --logo"));
+        assert!(!second.contains("/usr/local/bin/nash"));
+
+        // Stripping removes the block while keeping user content intact.
+        let cleaned = strip_managed_block(&second, LOGO_START, LOGO_END);
+        assert!(cleaned.contains("export FOO=bar"));
+        assert!(!cleaned.contains(LOGO_START));
+        assert!(!cleaned.contains("--logo"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

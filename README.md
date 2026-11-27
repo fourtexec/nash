@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="assets/nash-logo-text.jpg" alt="nash wordmark logo" width="480" />
+</p>
+
 # nash
+
+<img src="assets/nash-logo.jpg" alt="nash 1:1 logo" width="96" align="right" />
 
 Install (stable):
 ```sh
@@ -41,10 +47,13 @@ Run the tests with `cargo test`.
 ```
 
 This copies the binary to `/usr/local/bin` (or `~/.local/bin` if that is not
-writable), adds it to `/etc/shells` and makes it your login shell with `chsh`.
-It prints the command that undoes the change. Options: `--prefix DIR` installs
-into `DIR/bin`, `--no-chsh` installs the binary only. Because `install` is a
-subcommand, run a script that happens to be called `install` as `nash ./install`.
+writable), adds the texted `nash` startup logo hook to `~/.bashrc` (disable with
+`NASH_NO_LOGO=1` or `--no-logo`), adds `nash` to `/etc/shells` and makes it your
+login shell with `chsh`. It prints the command that undoes the change. Options:
+`--prefix DIR` installs into `DIR/bin`, `--no-chsh` installs the binary and
+`~/.bashrc` hook without changing the login shell, and `--no-logo` skips the
+`~/.bashrc` logo hook. Because `install` is a subcommand, run a script that
+happens to be called `install` as `nash ./install`.
 
 ## Update
 
