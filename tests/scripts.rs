@@ -104,23 +104,6 @@ fn security_hardening() {
     // 7. set -C noclobber rejects regular files but permits /dev/null
     let o = run("set -C; echo ok > /dev/null");
     assert_eq!(o.status.code(), Some(0));
-
-    // 8. Updater rejects insecure non-HTTPS URLs
-    let o = Command::new(bin)
-        .args(["update", "--list"])
-        .env("NASH_UPDATE_URL", "http://example.com/releases")
-        .output()
-        .unwrap();
-    assert_ne!(o.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("HTTPS"));
-
-    // 9. Installer rejects prefix containing control characters / newlines
-    let o = Command::new(bin)
-        .args(["install", "--prefix", "/tmp/bad\nprefix", "--no-chsh"])
-        .output()
-        .unwrap();
-    assert_ne!(o.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("invalid control characters"));
 }
 
 #[test]

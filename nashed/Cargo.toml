@@ -1,0 +1,19 @@
+[package]
+name = "nashed"
+version = "1.0.1"
+edition = "2021"
+description = "Package and version manager for the nash shell"
+license = "MIT"
+repository = "https://github.com/fourtexec/nash"
+homepage = "https://fourtexec.site"
+documentation = "https://github.com/fourtexec/nash/tree/main/nashed"
+readme = "README.md"
+keywords = ["nash", "shell", "installer", "package-manager", "cli"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "nashed"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

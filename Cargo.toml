@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "nashed"]
+default-members = [".", "nashed"]
+
 [package]
 name = "nash"
 version = "1.0.1"

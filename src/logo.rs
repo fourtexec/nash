@@ -1,6 +1,6 @@
 //! Terminal logo for `nash`, generated directly from `assets/nash-logo-text.jpg`
 //! and rendered on interactive startup and via `nash --logo` (including from
-//! `~/.bashrc` when configured by `nash install`).
+//! `~/.bashrc` when configured by `nashed install`).
 
 use crate::shell::Shell;
 use crate::sys;

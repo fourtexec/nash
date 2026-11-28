@@ -6,19 +6,21 @@
 
 <img src="assets/nash-logo.jpg" alt="nash 1:1 logo" width="96" align="right" />
 
-Install (stable):
+Install `nashed` (the package manager for `nash`) via Cargo, then install `nash`:
 ```sh
-wget -qO- https://raw.githubusercontent.com/fourtexec/nash/main/install.sh | sh
+cargo install nashed
+nashed install
 ```
 
-Install (dev / latest build):
+Install the latest development build or a specific version:
 ```sh
-wget -qO- https://raw.githubusercontent.com/fourtexec/nash/main/install-dev.sh | sh
+nashed install dev
+nashed install 1.0.1
 ```
 
 **nash** is a modern descendant of `sh`, written in Rust. It runs your existing
 sh/bash scripts, takes the best interactive ideas from zsh, and adds a few of
-its own. The only dependency is `libc`.
+its own.
 
 ```
 ~/code/nash (main) ❯ fn greet(name, greeting=Hello) { echo "$greeting, $name!"; }
@@ -31,67 +33,57 @@ nash: gti: command not found (did you mean `git'?)
 ## Build
 
 ```bash
-cargo build --release
+cargo build --release --workspace
 ```
 
 ```bash
 ./target/release/nash
+./target/release/nashed --help
 ```
 
-Run the tests with `cargo test`.
+Run the tests with `cargo test --workspace`.
 
-## Install as your main shell
+## Managing nash with nashed
+
+All installation, version switching, updates, and uninstallation are handled by
+`nashed` (located in `nashed/` and publishable to crates.io via `cargo publish -p nashed`).
 
 ```bash
-./target/release/nash install
+# Install latest stable nash (sets up binary, ~/.bashrc logo hook, /etc/shells, chsh)
+nashed install
+
+# Install latest dev build or an exact version
+nashed install dev
+nashed install 1.0.1
+nashed install dev7
+
+# Install a local nash binary
+nashed install ./target/release/nash
 ```
 
-This copies the binary to `/usr/local/bin` (or `~/.local/bin` if that is not
-writable), adds the texted `nash` startup logo hook to `~/.bashrc` (disable with
-`NASH_NO_LOGO=1` or `--no-logo`), adds `nash` to `/etc/shells` and makes it your
-login shell with `chsh`. It prints the command that undoes the change. Options:
-`--prefix DIR` installs into `DIR/bin`, `--no-chsh` installs the binary and
-`~/.bashrc` hook without changing the login shell, and `--no-logo` skips the
-`~/.bashrc` logo hook. Because `install` is a subcommand, run a script that
-happens to be called `install` as `nash ./install`.
+Options for `nashed install`:
+- `--prefix DIR` installs into `DIR/bin`
+- `--no-chsh` skips `/etc/shells` and `chsh`
+- `--no-logo` skips the `~/.bashrc` startup logo hook
+- `--force` reinstalls even if already installed
 
-## Update
+### Updating and uninstalling
 
 ```bash
-nash update
+nashed update             # update nash to the newest stable release
+nashed update dev         # update nash to the newest development build
+nashed update 1.0.1       # switch nash to a specific release
+nashed update --check     # check whether an update is available (exit 1 if so)
+nashed update self        # update nashed itself
+nashed list               # list releases available for this platform
+nashed uninstall          # remove nash, managed rc blocks, and /etc/shells entry
 ```
 
-installs the newest stable release. nash asks GitHub for the releases of
-`fourtexec/nash`, takes from the release the binary named after your platform
-(`nash-<os>-<cpu>`, for example `nash-linux-x86_64`), downloads it with curl or
-wget, checks its SHA-256 and that it runs here, and then replaces the binary
-you are running (use `sudo` if it lives in `/usr/local/bin`).
-
-```bash
-nash update dev
-```
-
-installs the newest development build instead, and
-
-```bash
-nash update 0.1.0
-```
-
-installs exactly that release, older ones included (`nash update dev7` works
-too). `nash update --list` shows what is available for your platform,
-`--check` only reports whether there is something to install (exit status 1 if
-so) and `--force` reinstalls the version you already have.
-
-To install a binary you already have, without any download, give its path (with
-a `/` in it): `nash update ./nash-linux-x86_64`. It gets the same checks: it
-must be built for this operating system and CPU, run here and report itself as
-nash. As with `install`, run a script called `update` as `nash ./update`.
-
-Releases are made by the workflow in `.github/workflows/release.yml`: every
-push to `main` is a development build tagged `dev1`, `dev2`, `dev3`, ... and
-marked as a pre-release, and pushing a tag `v1.2.3` publishes the stable release
-`1.2.3`. Every release carries the same files, one binary per platform and
-`SHA256SUMS`, which is all `nash update` needs.
+Releases are built by `.github/workflows/release.yml`: every push to `main` is a
+development build tagged `dev1`, `dev2`, ... (marked as a pre-release), and
+pushing a tag `v1.2.3` publishes the stable release `1.2.3`. Every release
+carries platform binaries for both `nash` (`nash-<os>-<cpu>`) and `nashed`
+(`nashed-<os>-<cpu>`) alongside `SHA256SUMS`.
 
 The same workflow then updates the nash page of
 [fourtexec.site](https://fourtexec.site) with the newest releases and changes.

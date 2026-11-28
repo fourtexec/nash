@@ -13,12 +13,10 @@ mod expand;
 mod glob;
 mod highlight;
 mod history;
-mod install;
 mod logo;
 mod parser;
 mod prompt;
 mod shell;
-mod update;
 
 use editor::Input;
 use shell::{Flow, Shell, R};
@@ -38,11 +36,6 @@ options:
   --logo        print the nash terminal logo and exit
   --version     print version and exit
   --help        print this help
-
-nash install    install nash and make it your login shell (see `nash install --help')
-nash uninstall  remove nash installed by the install script
-nash update     update nash to the newest release; `nash update dev' and
-                `nash update VERSION' pick others (see `nash update --help')
 ";
 
 /// The version of this build: the release it was built for (`0.1.1`, `dev7`;
@@ -307,15 +300,6 @@ fn main() {
     // Rust ignores SIGPIPE by default; a shell must not.
     sys::default_signal(libc::SIGPIPE);
     let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
-    if args.get(1).map(|a| a == "install").unwrap_or(false) {
-        std::process::exit(install::install(&args[2..]));
-    }
-    if args.get(1).map(|a| a == "uninstall").unwrap_or(false) {
-        std::process::exit(install::uninstall(&args[2..]));
-    }
-    if args.get(1).map(|a| a == "update").unwrap_or(false) {
-        std::process::exit(update::update(&args[2..]));
-    }
     let mut sh = Shell::new();
     let mut command: Option<String> = None;
     let mut force_interactive = false;

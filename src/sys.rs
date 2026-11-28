@@ -270,28 +270,6 @@ pub fn random_u64() -> u64 {
     if v == 0 { 0x517CC1B727220A95 } else { v }
 }
 
-/// Locate an executable on `PATH` without spawning a shell.
-pub fn find_in_path(cmd: &str) -> Option<String> {
-    if cmd.is_empty() {
-        return None;
-    }
-    if cmd.contains('/') {
-        return is_executable(cmd).then(|| cmd.to_string());
-    }
-    let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
-        let full = if dir.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{}/{}", dir.trim_end_matches('/'), cmd)
-        };
-        if is_executable(&full) {
-            return Some(full);
-        }
-    }
-    None
-}
-
 /// Exclusively create a new temporary file with an unpredictable name and
 /// explicit permissions (`O_CREAT | O_EXCL`), preventing symlink attacks.
 pub fn create_temp_file(dir: &str, prefix: &str, mode: u32) -> std::io::Result<(String, File)> {
@@ -386,18 +364,6 @@ pub fn current_user() -> (String, Option<String>) {
             Some(std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned())
         };
         (name, dir)
-    }
-}
-
-/// Return the current user's configured login shell, or empty string if unknown.
-pub fn get_login_shell() -> String {
-    unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() || (*pw).pw_shell.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
-        }
     }
 }
 

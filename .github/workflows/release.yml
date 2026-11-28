@@ -1,13 +1,13 @@
 name: release
 
-# Builds nash for every supported platform and publishes the binaries as a
-# release:
+# Builds nash and nashed for every supported platform and publishes the binaries
+# as a release:
 #   - every push to main is a development build tagged dev1, dev2, dev3, ...
 #     and marked as a pre-release
 #   - pushing a tag v1.2.3 is the stable release 1.2.3
-# Every release carries the same files (nash-<os>-<cpu> and SHA256SUMS), and
-# `nash update`, `nash update dev` and `nash update VERSION` download the one
-# for their platform straight from the release.
+# Every release carries the same files (nash-<os>-<cpu>, nashed-<os>-<cpu>, and
+# SHA256SUMS), and `nashed install` / `nashed update` / `nashed update self`
+# download the binary for their platform straight from the release.
 # After a release the `site` job updates the nash page of fourtexec.site.
 on:
   push:
@@ -62,10 +62,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: nash-linux-x86_64 }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: nash-linux-aarch64 }
-          - { os: macos-latest, target: x86_64-apple-darwin, asset: nash-macos-x86_64 }
-          - { os: macos-latest, target: aarch64-apple-darwin, asset: nash-macos-aarch64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, suffix: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, suffix: linux-aarch64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, suffix: macos-x86_64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, suffix: macos-aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -74,14 +74,18 @@ jobs:
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Rename the binary
-        run: cp target/${{ matrix.target }}/release/nash ${{ matrix.asset }}
+      - name: Build nash and nashed
+        run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+      - name: Rename the binaries
+        run: |
+          cp target/${{ matrix.target }}/release/nash nash-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/nashed nashed-${{ matrix.suffix }}
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: nash-${{ matrix.suffix }}
+          path: |
+            nash-${{ matrix.suffix }}
+            nashed-${{ matrix.suffix }}
 
   build-android-termux:
     name: Build Android (Termux, aarch64, latest NDK)
@@ -96,18 +100,22 @@ jobs:
         id: setup-ndk
         with:
           ndk-version: r30
-      - name: Build release binary
+      - name: Build release binaries
         env:
           NASH_RELEASE: ${{ needs.name.outputs.tag }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
-        run: cargo build --release --locked --target aarch64-linux-android
-      - name: Rename the binary
-        run: cp target/aarch64-linux-android/release/nash nash-android-aarch64
+        run: cargo build --release --locked --workspace --target aarch64-linux-android
+      - name: Rename the binaries
+        run: |
+          cp target/aarch64-linux-android/release/nash nash-android-aarch64
+          cp target/aarch64-linux-android/release/nashed nashed-android-aarch64
       - uses: actions/upload-artifact@v4
         with:
           name: nash-android-aarch64
-          path: nash-android-aarch64
+          path: |
+            nash-android-aarch64
+            nashed-android-aarch64
 
   release:
     needs: [name, build, build-android-termux]
@@ -125,7 +133,7 @@ jobs:
         env:
           TAG: ${{ needs.name.outputs.tag }}
         run: |
-          sha256sum nash-* > SHA256SUMS
+          sha256sum nash-* nashed-* > SHA256SUMS
           cat SHA256SUMS
           # The first builds of nash update themselves by reading the file
           # VERSION of the latest release: give stable releases one, so
@@ -137,7 +145,7 @@ jobs:
           TAG: ${{ needs.name.outputs.tag }}
         run: |
           # A development build is a pre-release, so that GitHub's "latest
-          # release" (and with it `nash update`) is always a stable one.
+          # release" (and with it `nashed install` / `nashed update`) is always a stable one.
           case "$TAG" in
             dev*) kind="--prerelease --latest=false" ;;
             *) kind="" ;;
