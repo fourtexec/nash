@@ -20,13 +20,57 @@ const GROUPS: &[(&str, &str)] = &[
 ];
 
 pub fn default_ls_colors() -> String {
-    let mut s = String::from("rs=0:di=1;34:ln=1;36:or=1;31:pi=33:so=1;35:bd=1;33:cd=1;33:ex=1;32:su=37;41:sg=30;43:tw=30;42:ow=34;42:st=37;44:*~=90:*Makefile=1;33:*Dockerfile=1;33:*README=1;33:*LICENSE=33:");
+    let mut s = String::with_capacity(1536);
+    s.push_str("rs=0:di=1;34:ln=1;36:or=1;31:pi=33:so=1;35:bd=1;33:cd=1;33:ex=1;32:su=37;41:sg=30;43:tw=30;42:ow=34;42:st=37;44:*~=90:*Makefile=1;33:*Dockerfile=1;33:*README=1;33:*LICENSE=33:");
     for (color, exts) in GROUPS {
         for e in exts.split(' ') {
-            s.push_str(&format!("*.{}={}:", e, color));
+            s.push_str("*.");
+            s.push_str(e);
+            s.push('=');
+            s.push_str(color);
+            s.push(':');
         }
     }
     s
+}
+
+#[allow(dead_code)]
+fn is_busybox(path: &str) -> bool {
+    std::fs::read_link(path)
+        .ok()
+        .and_then(|t| t.to_str().map(|s| s.contains("busybox")))
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)]
+fn probe_quiet(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)]
+fn probe_grep_color() -> bool {
+    use std::io::Write;
+    let mut child = match std::process::Command::new("grep")
+        .args(["--color=auto", "-q", "x"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"x\n");
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 /// Called for interactive shells before the rc file is read, so everything
@@ -39,27 +83,41 @@ pub fn setup(sh: &mut Shell) {
         let _ = sh.set_str("LS_COLORS", default_ls_colors());
         sh.export_var("LS_COLORS");
     }
-    let quiet = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-    let has_grep_color = || {
-        use std::io::Write;
-        let mut child = match std::process::Command::new("grep")
-            .args(["--color=auto", "-q", "x"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
+    #[cfg(target_os = "linux")]
+    let (has_gnu_ls, has_grep, has_diff) = {
+        let ls = sh.find_command("ls").is_some();
+        let grep = match sh.find_command("grep") {
+            Some(p) if !is_busybox(&p) => true,
+            Some(_) => probe_grep_color(),
+            None => false,
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(b"x\n");
-        }
-        child.wait().map(|s| s.success()).unwrap_or(false)
+        let diff = match sh.find_command("diff") {
+            Some(p) if !is_busybox(&p) => true,
+            Some(_) => probe_quiet("diff", &["--color=auto", "/dev/null", "/dev/null"]),
+            None => false,
+        };
+        (ls, grep, diff)
     };
-    let has_gnu_ls = quiet("ls", &["--color=auto", "-d", "/"]);
-    let has_grep = has_grep_color();
-    let has_diff = quiet("diff", &["--color=auto", "/dev/null", "/dev/null"]);
+    #[cfg(target_os = "macos")]
+    let (has_gnu_ls, has_grep, has_diff) = {
+        let ls = match sh.find_command("ls").as_deref() {
+            Some("/bin/ls") | None => false,
+            Some(_) => probe_quiet("ls", &["--color=auto", "-d", "/"]),
+        };
+        let grep = match sh.find_command("grep").as_deref() {
+            Some("/usr/bin/grep") => true,
+            Some(_) => probe_grep_color(),
+            None => false,
+        };
+        let diff = probe_quiet("diff", &["--color=auto", "/dev/null", "/dev/null"]);
+        (ls, grep, diff)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let (has_gnu_ls, has_grep, has_diff) = (
+        probe_quiet("ls", &["--color=auto", "-d", "/"]),
+        probe_grep_color(),
+        probe_quiet("diff", &["--color=auto", "/dev/null", "/dev/null"]),
+    );
     let has_tree = sh.find_command("tree").is_some();
     if !has_gnu_ls {
         let _ = sh.set_str("CLICOLOR", "1");

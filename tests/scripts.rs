@@ -122,3 +122,98 @@ fn security_hardening() {
     assert_ne!(o.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&o.stderr).contains("invalid control characters"));
 }
+
+#[test]
+fn optimization_correctness() {
+    let bin = env!("CARGO_BIN_EXE_nash");
+    let run = |src: &str| Command::new(bin).args(["--norc", "-c", src]).output().unwrap();
+    let stdout = |o: &std::process::Output| String::from_utf8_lossy(&o.stdout).into_owned();
+
+    // 1. Val::Int interoperability with strings, env export, readonly, append, length, float
+    let o = run("x=5; ((x++)); echo \"$x:${#x}\"; x+=abc; echo \"$x\"");
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), "6:1\n6abc\n");
+
+    let o = run("x=$((10 + 32)); export x; /usr/bin/env | grep '^x='; x=$((x + 1)); /usr/bin/env | grep '^x='; unset x; /usr/bin/env | grep '^x=' || echo gone");
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), "x=42\nx=43\ngone\n");
+
+    let o = run("readonly r=1; ((r++))");
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("readonly"));
+
+    let o = run("f=$((1.5 + 2.5)); g=$((1.5 + 2.25)); echo \"$f:$g\"");
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), "4.0:3.75\n");
+
+    // 2. Compiled arithmetic semantics (precedence, right-assoc **, short-circuit, non-pure RHS)
+    let o = run("echo $((2**3**2))");
+    assert_eq!(stdout(&o), "512\n");
+
+    let o = run("a=0; b=0; echo $((1 ? 10 : ++a)) $((0 ? ++b : 20)) $a $b");
+    assert_eq!(stdout(&o), "10 20 0 0\n");
+
+    let o = run("a=0; b=0; echo $((0 && ++a)) $((1 || ++b)) $a $b");
+    assert_eq!(stdout(&o), "0 1 0 0\n");
+
+    let o = run("x=1; ((x += (x = 5))); echo $x");
+    assert_eq!(stdout(&o), "6\n");
+
+    let o = run("s=0; for ((i=1; i<=100; i++)); do ((s+=i)); done; echo $s");
+    assert_eq!(stdout(&o), "5050\n");
+
+    // 3. In-process command substitution isolation & edge cases
+    let o = run("x=0; y=$(echo $((x++))); echo \"$x:$y\"");
+    assert_eq!(stdout(&o), "0:0\n");
+
+    let o = run("x=''; y=$(echo \"${x:=hi}\"); echo \"[$x][$y]\"");
+    assert_eq!(stdout(&o), "[][hi]\n");
+
+    let o = run("z=orig; y=$(printf -v z changed); echo \"$z:$y\"");
+    assert_eq!(stdout(&o), "orig:\n");
+
+    let o = run("echo() { printf 'CUSTOM:%s\\n' \"$*\"; }; y=$(echo hi there); printf '%s\\n' \"$y\"");
+    assert_eq!(stdout(&o), "CUSTOM:hi there\n");
+
+    let o = run("y=$(echo \"a $(echo b)\"); echo \"$y\"");
+    assert_eq!(stdout(&o), "a b\n");
+
+    let o = run("y=$(echo -e 'a\\nb\\n\\n'); printf '[%s]\\n' \"$y\"");
+    assert_eq!(stdout(&o), "[a\nb]\n");
+
+    let o = run("$(false); a=$?; $(true); b=$?; echo \"$a:$b\"");
+    assert_eq!(stdout(&o), "1:0\n");
+
+    let o = run("a=$(pwd); b=$(/bin/pwd); test -n \"$a\" && echo ok");
+    assert_eq!(stdout(&o), "ok\n");
+
+    // 4. posix_spawn external execution edge cases
+    let o = run("/bin/true; echo $?; /bin/false; echo $?");
+    assert_eq!(stdout(&o), "0\n1\n");
+
+    let o = run("/nonexistent_nash_bin_12345 2>/dev/null; echo $?");
+    assert_eq!(stdout(&o), "127\n");
+
+    let o = run("/tmp 2>/dev/null; echo $?");
+    assert_eq!(stdout(&o), "126\n");
+
+    let o = run("FOO=outer; r=$(FOO=inner /usr/bin/env | grep '^FOO='); echo \"$r:$FOO\"");
+    assert_eq!(stdout(&o), "FOO=inner:outer\n");
+
+    let o = run("x=$(/bin/echo external_ok); echo \"$x\"");
+    assert_eq!(stdout(&o), "external_ok\n");
+
+    // 5. ENOEXEC script (executable file without #! shebang)
+    let tmp = std::env::temp_dir().join(format!("nash_enoexec_{}.sh", std::process::id()));
+    std::fs::write(&tmp, "echo enoexec_ok\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let o = run(&tmp.to_string_lossy());
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), "enoexec_ok\n");
+}
+

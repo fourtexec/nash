@@ -523,7 +523,7 @@ impl Parser {
                     Ok(Some(end)) => {
                         let raw = self.text(self.pos + 3, end);
                         self.pos = end + 2;
-                        return Ok(Some(WordPart::Arith(raw)));
+                        return Ok(Some(WordPart::Arith(Box::new(crate::arith::CompiledArith::new(raw)))));
                     }
                     Ok(None) => {}
                     Err(()) => {
@@ -1289,9 +1289,9 @@ impl Parser {
                     let raw = self.text(self.pos + 2, end);
                     self.pos = end + 2;
                     let mut it = raw.splitn(3, ';');
-                    let init = it.next().unwrap_or("").to_string();
-                    let cond = it.next().unwrap_or("").to_string();
-                    let step = it.next().unwrap_or("").to_string();
+                    let init = Box::new(crate::arith::CompiledArith::new(it.next().unwrap_or("").to_string()));
+                    let cond = Box::new(crate::arith::CompiledArith::new(it.next().unwrap_or("").to_string()));
+                    let step = Box::new(crate::arith::CompiledArith::new(it.next().unwrap_or("").to_string()));
                     self.skip_ws();
                     self.eat(";");
                     let body = self.parse_loop_body()?;
@@ -1465,7 +1465,7 @@ impl Parser {
                     if let Some(end) = arith {
                         let raw = self.text(self.pos + 2, end);
                         self.pos = end + 2;
-                        Cmd::Arith(raw)
+                        Cmd::Arith(Box::new(crate::arith::CompiledArith::new(raw)))
                     } else {
                         self.pos += 1;
                         let body = self.parse_list(false)?;

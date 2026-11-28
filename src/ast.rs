@@ -1,5 +1,6 @@
 //! Abstract syntax tree for the nash language.
 
+use crate::arith::CompiledArith;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -14,7 +15,7 @@ pub enum WordPart {
     DQuote(Vec<WordPart>),
     Param(Box<ParamExp>),
     CmdSubst(Rc<Cmd>),
-    Arith(String),
+    Arith(Box<CompiledArith>),
     Tilde(String),
     /// Process substitution; `true` means `<(...)`.
     ProcSubst(bool, Rc<Cmd>),
@@ -141,11 +142,11 @@ pub enum Cmd {
     If { conds: Vec<(Cmd, Cmd)>, else_: Option<Box<Cmd>> },
     While { cond: Box<Cmd>, body: Box<Cmd>, until: bool },
     For { var: String, words: Option<Vec<Word>>, body: Box<Cmd> },
-    CFor { init: String, cond: String, step: String, body: Box<Cmd> },
+    CFor { init: Box<CompiledArith>, cond: Box<CompiledArith>, step: Box<CompiledArith>, body: Box<Cmd> },
     Case { word: Word, arms: Vec<(Vec<Word>, Cmd, CaseTerm)> },
     FuncDef(Rc<Func>),
     Cond(CondExpr),
-    Arith(String),
+    Arith(Box<CompiledArith>),
     Try { body: Box<Cmd>, catch: Option<Box<Cmd>> },
     Redirected(Box<Cmd>, Vec<Redir>),
 }

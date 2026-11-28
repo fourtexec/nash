@@ -1413,6 +1413,7 @@ impl Shell {
         if args.is_empty() {
             for (n, v) in self.all_vars() {
                 match &v.val {
+                    Val::Int(i) => out!("{}='{}'\n", n, i),
                     Val::Str(s) => out!("{}={}\n", n, shell_quote(s)),
                     Val::Arr(a) => out!("{}=({})\n", n, a.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" ")),
                     Val::Map(m) => out!("{}=({})\n", n, m.iter().map(|(k, s)| format!("[{}]={}", shell_quote(k), shell_quote(s))).collect::<Vec<_>>().join(" ")),

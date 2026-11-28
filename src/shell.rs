@@ -4,8 +4,95 @@ use crate::ast::Func;
 use crate::history::History;
 use crate::sys;
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::CString;
+use std::hash::{BuildHasher, Hasher};
 use std::rc::Rc;
 use std::time::Instant;
+
+/// Fast non-cryptographic hasher for short shell identifiers (variables, functions, PATH hash).
+#[derive(Default, Clone, Copy)]
+pub struct FxBuildHasher;
+
+pub struct FxHasher {
+    hash: usize,
+}
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    #[inline]
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher { hash: 0 }
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash as u64
+    }
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        const K: usize = 0x517cc1b727220a95;
+        let mut h = self.hash;
+        while bytes.len() >= 8 {
+            let w = usize::from_ne_bytes(bytes[..8].try_into().unwrap());
+            h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+            bytes = &bytes[8..];
+        }
+        if bytes.len() >= 4 {
+            let w = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as usize;
+            h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+            bytes = &bytes[4..];
+        }
+        if bytes.len() >= 2 {
+            let w = u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as usize;
+            h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+            bytes = &bytes[2..];
+        }
+        if let Some(&b) = bytes.first() {
+            h = (h.rotate_left(5) ^ (b as usize)).wrapping_mul(K);
+        }
+        self.hash = h;
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        const K: usize = 0x517cc1b727220a95;
+        self.hash = (self.hash.rotate_left(5) ^ (i as usize)).wrapping_mul(K);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        const K: usize = 0x517cc1b727220a95;
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(K);
+    }
+}
+
+pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+
+#[inline]
+pub fn fx_map<K, V>() -> FxHashMap<K, V> {
+    HashMap::with_hasher(FxBuildHasher)
+}
+
+#[inline]
+pub fn fx_map_with_capacity<K, V>(cap: usize) -> FxHashMap<K, V> {
+    HashMap::with_capacity_and_hasher(cap, FxBuildHasher)
+}
+
+fn make_env_cstring(k: &str, v: &str) -> CString {
+    let mut buf = Vec::with_capacity(k.len() + 1 + v.len());
+    for &b in k.as_bytes() {
+        if b != 0 {
+            buf.push(b);
+        }
+    }
+    buf.push(b'=');
+    for &b in v.as_bytes() {
+        if b != 0 {
+            buf.push(b);
+        }
+    }
+    CString::new(buf).unwrap()
+}
 
 /// Non-local control flow.
 #[derive(Debug)]
@@ -26,6 +113,7 @@ pub type R = Result<i32, Flow>;
 #[derive(Clone, Debug)]
 pub enum Val {
     Unset,
+    Int(i64),
     Str(String),
     Arr(Vec<String>),
     Map(Vec<(String, String)>),
@@ -163,10 +251,10 @@ fn is_locale_var(name: &str) -> bool {
 }
 
 pub struct Shell {
-    pub scopes: Vec<HashMap<String, Var>>,
+    pub scopes: Vec<FxHashMap<String, Var>>,
     pub pos_params: Vec<String>,
     pub arg0: String,
-    pub funcs: HashMap<String, Rc<Func>>,
+    pub funcs: FxHashMap<String, Rc<Func>>,
     pub aliases: Rc<HashMap<String, String>>,
     pub last_status: i32,
     pub last_bg: i32,
@@ -185,7 +273,7 @@ pub struct Shell {
     pub cond_depth: u32,
     pub try_depth: u32,
     pub source_depth: u32,
-    pub hash: HashMap<String, String>,
+    pub hash: FxHashMap<String, String>,
     pub defers: Vec<Vec<Vec<String>>>,
     pub exec_direct: bool,
     pub last_subst: Option<i32>,
@@ -223,6 +311,11 @@ pub struct Shell {
     /// Last branch name and `HEAD` metadata, so a prompt in the same
     /// repository does not re-read the file when it has not changed.
     pub(crate) git_branch_cache: Option<GitBranchCache>,
+    /// Cached null-terminated `envp` built from global exported variables.
+    /// Avoids rebuilding 40+ `CString` allocations on every external spawn.
+    env_cache_strings: Vec<CString>,
+    env_cache_ptrs: Vec<*const libc::c_char>,
+    pub env_dirty: bool,
 }
 
 impl Shell {
@@ -232,7 +325,7 @@ impl Shell {
         // Import the environment in a single pass. Doing it once is cheap, and
         // it makes `$VAR`, `$<TAB>`, prompt escapes and child processes all see
         // the variables the shell was started with.
-        let mut global = HashMap::new();
+        let mut global = fx_map_with_capacity(64);
         for (k, v) in std::env::vars_os() {
             let (Some(k), Some(v)) = (k.to_str(), v.to_str()) else { continue };
             if crate::parser::is_name(k) {
@@ -243,7 +336,7 @@ impl Shell {
             scopes: vec![global],
             pos_params: Vec::new(),
             arg0: "nash".into(),
-            funcs: HashMap::new(),
+            funcs: fx_map(),
             aliases: Rc::new(HashMap::new()),
             last_status: 0,
             last_bg: 0,
@@ -262,7 +355,7 @@ impl Shell {
             cond_depth: 0,
             try_depth: 0,
             source_depth: 0,
-            hash: HashMap::new(),
+            hash: fx_map(),
             defers: vec![Vec::new()],
             exec_direct: false,
             last_subst: None,
@@ -275,7 +368,7 @@ impl Shell {
             cur_text: String::new(),
             path_cmds: None,
             self_exe: std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "nash".into()),
-            rng: sys::random_u64(),
+            rng: 0,
             in_trap: false,
             term_modes: None,
             getopts_off: 0,
@@ -289,6 +382,9 @@ impl Shell {
             prompt_utf8: None,
             git_cache: None,
             git_branch_cache: None,
+            env_cache_strings: Vec::new(),
+            env_cache_ptrs: Vec::new(),
+            env_dirty: true,
         };
         let host = sys::hostname();
         sh.hostname = host.clone();
@@ -338,7 +434,14 @@ impl Shell {
 
     // ---------- variables ----------
 
+    #[inline]
     pub fn var(&self, name: &str) -> Option<&Var> {
+        if self.scopes.len() == 1 {
+            return match self.scopes[0].get(name) {
+                Some(v) if !matches!(v.val, Val::Unset) => Some(v),
+                _ => None,
+            };
+        }
         for s in self.scopes.iter().rev() {
             if let Some(v) = s.get(name) {
                 return if matches!(v.val, Val::Unset) { None } else { Some(v) };
@@ -347,11 +450,18 @@ impl Shell {
         None
     }
 
+    #[inline]
     fn scope_of(&self, name: &str) -> Option<usize> {
+        if self.scopes.len() == 1 {
+            return if self.scopes[0].contains_key(name) { Some(0) } else { None };
+        }
         (0..self.scopes.len()).rev().find(|&i| self.scopes[i].contains_key(name))
     }
 
     pub fn next_random(&mut self) -> u64 {
+        if self.rng == 0 {
+            self.rng = sys::random_u64();
+        }
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
@@ -359,15 +469,19 @@ impl Shell {
     }
 
     /// Borrow a scalar variable without allocating when it is not a dynamic special variable.
+    #[inline]
     pub fn get_cow(&mut self, name: &str) -> Option<std::borrow::Cow<'_, str>> {
         use std::borrow::Cow;
-        match name {
-            "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "FUNCNAME" | "USER" => {
-                return self.get(name).map(Cow::Owned);
+        if matches!(name.as_bytes().first(), Some(b'R' | b'S' | b'E' | b'L' | b'F' | b'U')) {
+            match name {
+                "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "FUNCNAME" | "USER" => {
+                    return self.get(name).map(Cow::Owned);
+                }
+                _ => {}
             }
-            _ => {}
         }
         match &self.var(name)?.val {
+            Val::Int(n) => Some(Cow::Owned(n.to_string())),
             Val::Str(s) => Some(Cow::Borrowed(s.as_str())),
             Val::Arr(a) => a.first().map(|s| Cow::Borrowed(s.as_str())),
             Val::Map(m) => m.iter().find(|(k, _)| k == "0").map(|(_, v)| Cow::Borrowed(v.as_str())),
@@ -377,33 +491,89 @@ impl Shell {
 
     /// Scalar value of a variable (first element for arrays).
     pub fn get(&mut self, name: &str) -> Option<String> {
-        match name {
-            "RANDOM" => return Some((self.next_random() % 32768).to_string()),
-            "SECONDS" => return Some(self.start.elapsed().as_secs().to_string()),
-            "EPOCHSECONDS" => return Some(sys::now_secs().to_string()),
-            "EPOCHREALTIME" => {
-                let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                return Some(format!("{}.{:06}", d.as_secs(), d.subsec_micros()));
-            }
-            "LINENO" => return Some(self.lineno.to_string()),
-            "FUNCNAME" => return self.func_names.last().cloned(),
-            "USER" => {
-                if let Some(u) = self.user_name.as_ref() {
-                    return Some(u.clone());
+        if matches!(name.as_bytes().first(), Some(b'R' | b'S' | b'E' | b'L' | b'F' | b'U')) {
+            match name {
+                "RANDOM" => return Some((self.next_random() % 32768).to_string()),
+                "SECONDS" => return Some(self.start.elapsed().as_secs().to_string()),
+                "EPOCHSECONDS" => return Some(sys::now_secs().to_string()),
+                "EPOCHREALTIME" => {
+                    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    return Some(format!("{}.{:06}", d.as_secs(), d.subsec_micros()));
                 }
-                let u = sys::current_user().0;
-                self.user_name = Some(u.clone());
-                let _ = self.set_str("USER", u.clone());
-                self.export_var("USER");
-                return Some(u);
+                "LINENO" => return Some(self.lineno.to_string()),
+                "FUNCNAME" => return self.func_names.last().cloned(),
+                "USER" => {
+                    if let Some(u) = self.user_name.as_ref() {
+                        return Some(u.clone());
+                    }
+                    let u = sys::current_user().0;
+                    self.user_name = Some(u.clone());
+                    let _ = self.set_str("USER", u.clone());
+                    self.export_var("USER");
+                    return Some(u);
+                }
+                _ => {}
             }
-            _ => {}
         }
         match &self.var(name)?.val {
+            Val::Int(n) => Some(n.to_string()),
             Val::Str(s) => Some(s.clone()),
             Val::Arr(a) => a.first().cloned(),
             Val::Map(m) => m.iter().find(|(k, _)| k == "0").map(|(_, v)| v.clone()),
             Val::Unset => None,
+        }
+    }
+
+    /// Fast arithmetic lookup for a scalar variable: returns `Some(Ok(n))` immediately
+    /// when stored natively as `Val::Int(n)`, avoiding string formatting/parsing.
+    #[inline]
+    pub fn get_int_fast(&self, name: &str) -> Option<i64> {
+        if matches!(name.as_bytes().first(), Some(b'R' | b'S' | b'E' | b'L' | b'F' | b'U'))
+            && matches!(name, "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "FUNCNAME" | "USER")
+        {
+            return None;
+        }
+        match self.var(name)?.val {
+            Val::Int(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Single-lookup in-place integer addition (`i++`, `i--`, `sum += x`).
+    /// Returns `Some(Ok((old, new)))` on hit, `Some(Err(..))` on readonly,
+    /// or `None` if the variable does not exist or is not currently a `Val::Int`.
+    #[inline]
+    pub fn add_i64_in_place(&mut self, name: &str, delta: i64) -> Option<Result<(i64, i64), String>> {
+        if matches!(name.as_bytes().first(), Some(b'R' | b'S' | b'E' | b'L' | b'F' | b'U' | b'I' | b'P' | b'H'))
+            && matches!(
+                name,
+                "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "LINENO" | "FUNCNAME" | "USER"
+                | "IFS" | "PATH" | "PS1" | "RPROMPT" | "RPS1" | "PWD" | "HOME" | "LC_ALL" | "LC_CTYPE" | "LANG"
+            )
+        {
+            return None;
+        }
+        let idx = if self.scopes.len() == 1 {
+            0
+        } else {
+            self.scope_of(name)?
+        };
+        let allexport = self.opts.allexport;
+        let v = self.scopes[idx].get_mut(name)?;
+        if let Val::Int(ref mut n) = v.val {
+            if v.readonly {
+                return Some(Err(format!("{}: readonly variable", name)));
+            }
+            let old = *n;
+            let new = old.wrapping_add(delta);
+            *n = new;
+            if allexport || v.exported {
+                v.exported = true;
+                self.env_dirty = true;
+            }
+            Some(Ok((old, new)))
+        } else {
+            None
         }
     }
 
@@ -419,8 +589,14 @@ impl Shell {
                 if allexport {
                     v.exported = true;
                 }
+                if v.exported {
+                    self.env_dirty = true;
+                }
             }
             None => {
+                if allexport {
+                    self.env_dirty = true;
+                }
                 self.scopes[idx].insert(name.to_string(), Var { val, exported: allexport, readonly: false });
             }
         }
@@ -437,32 +613,37 @@ impl Shell {
         self.set(name, Val::Str(val.into()))
     }
 
-    /// Fast integer assignment that reuses the existing string buffer in place when possible.
+    /// Fast integer assignment storing `Val::Int(val)` natively without decimal formatting.
+    #[inline]
     pub fn set_i64(&mut self, name: &str, val: i64) -> Result<(), String> {
-        use std::fmt::Write;
-        let idx = self.scope_of(name).unwrap_or(0);
+        // Keep special shell/prompt/IFS variables as strings so `&str` accessors always see Val::Str.
+        if matches!(name.as_bytes().first(), Some(b'I' | b'P' | b'R' | b'H' | b'L'))
+            && matches!(name, "IFS" | "PATH" | "PS1" | "RPROMPT" | "RPS1" | "PWD" | "HOME" | "LC_ALL" | "LC_CTYPE" | "LANG")
+        {
+            return self.set_str(name, val.to_string());
+        }
+        let idx = if self.scopes.len() == 1 {
+            0
+        } else {
+            self.scope_of(name).unwrap_or(0)
+        };
         let allexport = self.opts.allexport;
         if let Some(v) = self.scopes[idx].get_mut(name) {
             if v.readonly {
                 return Err(format!("{}: readonly variable", name));
             }
-            if let Val::Str(ref mut s) = v.val {
-                s.clear();
-                let _ = write!(s, "{}", val);
-            } else {
-                v.val = Val::Str(val.to_string());
-            }
+            v.val = Val::Int(val);
             if allexport {
                 v.exported = true;
             }
+            if v.exported {
+                self.env_dirty = true;
+            }
         } else {
-            self.scopes[idx].insert(name.to_string(), Var { val: Val::Str(val.to_string()), exported: allexport, readonly: false });
-        }
-        if name == "PATH" {
-            self.hash.clear();
-        }
-        if is_locale_var(name) {
-            self.prompt_utf8 = None;
+            if allexport {
+                self.env_dirty = true;
+            }
+            self.scopes[idx].insert(name.to_string(), Var { val: Val::Int(val), exported: allexport, readonly: false });
         }
         Ok(())
     }
@@ -476,6 +657,9 @@ impl Shell {
                     return Err(format!("{}: readonly variable", name));
                 }
                 v.val = val;
+                if v.exported {
+                    self.env_dirty = true;
+                }
             }
             None => {
                 self.scopes[top].insert(name.to_string(), Var { val, exported: false, readonly: false });
@@ -492,13 +676,20 @@ impl Shell {
             self.prompt_utf8 = None;
         }
         let idx = self.scope_of(name)?;
-        self.scopes[idx].get_mut(name)
+        let v = self.scopes[idx].get_mut(name)?;
+        if v.exported {
+            self.env_dirty = true;
+        }
+        Some(v)
     }
 
     pub fn unset_var(&mut self, name: &str) -> Result<(), String> {
         if let Some(idx) = self.scope_of(name) {
             if self.scopes[idx][name].readonly {
                 return Err(format!("{}: cannot unset: readonly variable", name));
+            }
+            if self.scopes[idx][name].exported {
+                self.env_dirty = true;
             }
             if idx == 0 {
                 self.scopes[0].remove(name);
@@ -516,12 +707,43 @@ impl Shell {
     }
 
     pub fn export_var(&mut self, name: &str) {
+        self.env_dirty = true;
         match self.var_mut(name) {
             Some(v) => v.exported = true,
             None => {
                 self.scopes[0].insert(name.to_string(), Var { val: Val::Unset, exported: true, readonly: false });
             }
         }
+    }
+
+    /// Return a cached, null-terminated `envp` pointer array for `scopes[0]` exported vars.
+    /// Must only be used when `self.scopes.len() == 1` and there are no per-command extra env vars.
+    pub fn cached_envp(&mut self) -> &[*const libc::c_char] {
+        if self.env_dirty || self.env_cache_ptrs.is_empty() {
+            self.env_cache_strings.clear();
+            self.env_cache_ptrs.clear();
+            for (k, v) in &self.scopes[0] {
+                if !v.exported {
+                    continue;
+                }
+                match &v.val {
+                    Val::Str(val) => {
+                        self.env_cache_strings.push(make_env_cstring(k, val));
+                    }
+                    Val::Int(n) => {
+                        self.env_cache_strings.push(make_env_cstring(k, &n.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+            self.env_cache_ptrs.reserve(self.env_cache_strings.len() + 1);
+            for s in &self.env_cache_strings {
+                self.env_cache_ptrs.push(s.as_ptr());
+            }
+            self.env_cache_ptrs.push(std::ptr::null());
+            self.env_dirty = false;
+        }
+        &self.env_cache_ptrs
     }
 
     pub fn environ(&self) -> BTreeMap<String, String> {
@@ -531,6 +753,9 @@ impl Shell {
                 match &v.val {
                     Val::Str(val) if v.exported => {
                         map.insert(k.clone(), val.clone());
+                    }
+                    Val::Int(n) if v.exported => {
+                        map.insert(k.clone(), n.to_string());
                     }
                     Val::Unset => {
                         map.remove(k);
@@ -588,9 +813,7 @@ impl Shell {
             return if std::fs::metadata(name).is_ok() { Some(name.to_string()) } else { None };
         }
         if let Some(p) = self.hash.get(name) {
-            if sys::is_executable(p) {
-                return Some(p.clone());
-            }
+            return Some(p.clone());
         }
         let path = self.get("PATH").unwrap_or_default();
         for dir in path.split(':') {

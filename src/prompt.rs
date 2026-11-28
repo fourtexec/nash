@@ -406,7 +406,7 @@ fn var_str<'a>(sh: &'a Shell, name: &str) -> Option<&'a str> {
         Val::Str(s) => Some(s.as_str()),
         Val::Arr(a) => a.first().map(String::as_str),
         Val::Map(m) => m.iter().find(|(k, _)| k == "0").map(|(_, v)| v.as_str()),
-        Val::Unset => None,
+        Val::Int(_) | Val::Unset => None,
     })
 }
 

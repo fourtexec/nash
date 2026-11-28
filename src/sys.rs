@@ -690,3 +690,221 @@ pub fn poll(fds: &mut [libc::pollfd], timeout: i32) -> i32 {
 pub fn fcntl_getfd(fd: i32) -> i32 {
     unsafe { libc::fcntl(fd, libc::F_GETFD) }
 }
+
+/// Spawn a child process directly via `posix_spawn` (uses vfork/clone on Linux,
+/// avoiding full page-table copy and COW faults of `fork` + `execve`).
+///
+/// Direct `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` + `execve` fast path on
+/// Linux when no file actions or signal resets are needed. Uses a separate
+/// 16-byte-aligned stack buffer (avoiding both `vfork` stack-sharing hazards
+/// and glibc `posix_spawn`'s `mmap`/`munmap` + 3x `rt_sigprocmask` syscalls).
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm",
+        target_arch = "riscv64",
+    )
+))]
+#[repr(C, align(16))]
+struct CloneStack([u8; 16384]);
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm",
+        target_arch = "riscv64",
+    )
+))]
+struct CloneExecArgs {
+    path: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+    exec_errno: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm",
+        target_arch = "riscv64",
+    )
+))]
+extern "C" fn clone_exec_child(arg: *mut libc::c_void) -> libc::c_int {
+    unsafe {
+        let a = &*(arg as *const CloneExecArgs);
+        libc::execve(a.path, a.argv, a.envp);
+        let e = *libc::__errno_location();
+        a.exec_errno.store(e, std::sync::atomic::Ordering::Relaxed);
+        libc::_exit(127);
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm",
+        target_arch = "riscv64",
+    )
+))]
+#[inline(never)]
+unsafe fn clone_vfork_exec(
+    path: *const libc::c_char,
+    argv: *const *const libc::c_char,
+    envp: *const *const libc::c_char,
+) -> Result<i32, i32> {
+    let mut stack = std::mem::MaybeUninit::<CloneStack>::uninit();
+    let stack_top = (stack.as_mut_ptr() as *mut u8)
+        .add(std::mem::size_of::<CloneStack>()) as *mut libc::c_void;
+    let mut args = CloneExecArgs {
+        path,
+        argv,
+        envp,
+        exec_errno: std::sync::atomic::AtomicI32::new(0),
+    };
+    let pid = libc::clone(
+        clone_exec_child,
+        stack_top,
+        libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+        &mut args as *mut CloneExecArgs as *mut libc::c_void,
+    );
+    if pid < 0 {
+        return Err(*libc::__errno_location());
+    }
+    let e = args.exec_errno.load(std::sync::atomic::Ordering::Relaxed);
+    if e != 0 {
+        let mut st: libc::c_int = 0;
+        while libc::waitpid(pid, &mut st, 0) < 0 {
+            if *libc::__errno_location() != libc::EINTR {
+                break;
+            }
+        }
+        return Err(e);
+    }
+    Ok(pid)
+}
+
+/// If `stdout_pipe` is `Some((r, w))`, closes `r`, dups `w` onto fd 1, and closes `w`
+/// in the child. If `reset_sigs` is non-empty, resets those signals to `SIG_DFL`.
+/// Returns `Ok(pid)` on success or `Err(errno)` on failure.
+pub fn posix_spawn(
+    path: &CString,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+    reset_sigs: &[i32],
+    stdout_pipe: Option<(i32, i32)>,
+) -> Result<i32, i32> {
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "arm",
+            target_arch = "riscv64",
+        )
+    ))]
+    if stdout_pipe.is_none() && reset_sigs.is_empty() {
+        return unsafe { clone_vfork_exec(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    }
+
+    let mut pid: libc::pid_t = 0;
+
+    let mut actions: std::mem::MaybeUninit<libc::posix_spawn_file_actions_t> =
+        std::mem::MaybeUninit::uninit();
+    let actions_ptr = if let Some((r, w)) = stdout_pipe {
+        unsafe {
+            let rc = libc::posix_spawn_file_actions_init(actions.as_mut_ptr());
+            if rc != 0 {
+                return Err(rc);
+            }
+            let ap = actions.as_mut_ptr();
+            let mut rc = libc::posix_spawn_file_actions_addclose(ap, r);
+            if rc == 0 && w != 1 {
+                rc = libc::posix_spawn_file_actions_adddup2(ap, w, 1);
+                if rc == 0 {
+                    rc = libc::posix_spawn_file_actions_addclose(ap, w);
+                }
+            }
+            if rc != 0 {
+                libc::posix_spawn_file_actions_destroy(ap);
+                return Err(rc);
+            }
+            ap as *const libc::posix_spawn_file_actions_t
+        }
+    } else {
+        std::ptr::null()
+    };
+
+    let mut attr: std::mem::MaybeUninit<libc::posix_spawnattr_t> =
+        std::mem::MaybeUninit::uninit();
+    let attr_ptr = if !reset_sigs.is_empty() {
+        unsafe {
+            let rc = libc::posix_spawnattr_init(attr.as_mut_ptr());
+            if rc != 0 {
+                if !actions_ptr.is_null() {
+                    libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+                }
+                return Err(rc);
+            }
+            let ap = attr.as_mut_ptr();
+            let mut sigset: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut sigset);
+            for &s in reset_sigs {
+                libc::sigaddset(&mut sigset, s);
+            }
+            let mut rc = libc::posix_spawnattr_setflags(ap, libc::POSIX_SPAWN_SETSIGDEF as libc::c_short);
+            if rc == 0 {
+                rc = libc::posix_spawnattr_setsigdefault(ap, &sigset);
+            }
+            if rc != 0 {
+                libc::posix_spawnattr_destroy(ap);
+                if !actions_ptr.is_null() {
+                    libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+                }
+                return Err(rc);
+            }
+            ap as *const libc::posix_spawnattr_t
+        }
+    } else {
+        std::ptr::null()
+    };
+
+    let rc = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            path.as_ptr(),
+            actions_ptr,
+            attr_ptr,
+            argv.as_ptr() as *const *mut libc::c_char,
+            envp.as_ptr() as *const *mut libc::c_char,
+        )
+    };
+
+    unsafe {
+        if !attr_ptr.is_null() {
+            libc::posix_spawnattr_destroy(attr.as_mut_ptr());
+        }
+        if !actions_ptr.is_null() {
+            libc::posix_spawn_file_actions_destroy(actions.as_mut_ptr());
+        }
+    }
+
+    if rc == 0 {
+        Ok(pid)
+    } else {
+        Err(rc)
+    }
+}
+

@@ -421,6 +421,14 @@ impl arith::Env for Shell {
             Some(i) => self.get_elem(name, i).ok().flatten().map(Cow::Owned),
         }
     }
+    #[inline]
+    fn get_int_fast(&self, name: &str) -> Option<i64> {
+        Shell::get_int_fast(self, name)
+    }
+    #[inline]
+    fn add_i64_in_place(&mut self, name: &str, delta: i64) -> Option<Result<(i64, i64), String>> {
+        Shell::add_i64_in_place(self, name, delta)
+    }
     fn set(&mut self, name: &str, idx: Option<&str>, val: String) -> Result<(), String> {
         match idx {
             None => self.set_str(name, val),
@@ -445,6 +453,21 @@ impl Shell {
     pub fn fail<T>(&mut self, msg: String) -> Result<T, Flow> {
         sherr!("{}", msg);
         Err(Flow::Abort(1))
+    }
+
+    #[inline]
+    pub fn eval_arith(&mut self, ca: &arith::CompiledArith) -> Result<Num, Flow> {
+        if let Some(ref expr) = ca.compiled {
+            match arith::eval_compiled(expr, self) {
+                Ok(n) => Ok(n),
+                Err(e) => {
+                    sherr!("{}", e);
+                    Err(Flow::Abort(1))
+                }
+            }
+        } else {
+            self.arith(&ca.raw)
+        }
     }
 
     pub fn arith(&mut self, expr: &str) -> Result<Num, Flow> {
@@ -524,6 +547,10 @@ impl Shell {
             {
                 let default_ifs = self.ifs_str() == " \t\n";
                 if default_ifs {
+                    if let Some(n) = self.get_int_fast(&pe.name) {
+                        out.push(n.to_string());
+                        return Ok(());
+                    }
                     let val = match self.get_cow(&pe.name) {
                         Some(v) => v.into_owned(),
                         None => {
@@ -612,7 +639,7 @@ impl Shell {
                     let t = self.expand_tilde(u);
                     out.push_str(&t);
                 }
-                WordPart::Arith(raw) => match self.arith(raw)? {
+                WordPart::Arith(ca) => match self.eval_arith(ca)? {
                     Num::I(i) => {
                         let _ = write!(out, "{}", i);
                     }
@@ -628,11 +655,15 @@ impl Shell {
                 }
                 WordPart::Param(pe) => {
                     if !pe.indirect && pe.index.is_none() && matches!(pe.op, ParamOp::Plain) && !is_special_name(&pe.name) {
-                        let nounset = self.opts.nounset;
-                        match self.get_cow(&pe.name) {
-                            Some(s) => out.push_str(&s),
-                            None if nounset => return self.fail(format!("{}: unbound variable", pe.name)),
-                            None => {}
+                        if let Some(n) = self.get_int_fast(&pe.name) {
+                            let _ = write!(out, "{}", n);
+                        } else {
+                            let nounset = self.opts.nounset;
+                            match self.get_cow(&pe.name) {
+                                Some(s) => out.push_str(&s),
+                                None if nounset => return self.fail(format!("{}: unbound variable", pe.name)),
+                                None => {}
+                            }
                         }
                     } else {
                         let mut fb = FB::new("", true);
@@ -686,8 +717,8 @@ impl Shell {
                     let t = self.expand_tilde(u);
                     fb.push_str(&t, true);
                 }
-                WordPart::Arith(raw) => {
-                    let v = self.arith(raw)?.fmt();
+                WordPart::Arith(ca) => {
+                    let v = self.eval_arith(ca)?.fmt();
                     if quoted {
                         fb.push_str(&v, true)
                     } else {
@@ -778,6 +809,13 @@ impl Shell {
                     None
                 }
             }
+            Val::Int(n) => {
+                if self.arith(idx)?.as_i() == 0 {
+                    Some(n.to_string())
+                } else {
+                    None
+                }
+            }
             Val::Unset => None,
         })
     }
@@ -857,6 +895,27 @@ impl Shell {
                     v.val = Val::Arr(a);
                     return Ok(());
                 }
+                Val::Int(n) => {
+                    let mut a = vec![n.to_string()];
+                    let mut ii = i;
+                    if ii < 0 {
+                        ii += a.len() as i64;
+                    }
+                    if !(0..=10_000_000).contains(&ii) {
+                        return self.fail(format!("{}[{}]: bad array subscript", name, idx));
+                    }
+                    let ii = ii as usize;
+                    while a.len() <= ii {
+                        a.push(String::new());
+                    }
+                    if append {
+                        a[ii].push_str(&val);
+                    } else {
+                        a[ii] = val;
+                    }
+                    v.val = Val::Arr(a);
+                    return Ok(());
+                }
                 Val::Unset => {
                     let mut a = Vec::new();
                     let mut ii = i;
@@ -915,6 +974,7 @@ impl Shell {
                 let at = i == "@";
                 Ok(match self.var(name).map(|v| v.val.clone()) {
                     Some(Val::Str(s)) => PV::List(vec![s], at),
+                    Some(Val::Int(n)) => PV::List(vec![n.to_string()], at),
                     Some(Val::Arr(a)) => PV::List(a, at),
                     Some(Val::Map(m)) => PV::List(m.into_iter().map(|(_, v)| v).collect(), at),
                     _ => match self.get(name) {
@@ -987,7 +1047,7 @@ impl Shell {
             let keys = match self.var(&name).map(|v| &v.val) {
                 Some(Val::Arr(a)) => (0..a.len()).map(|i| i.to_string()).collect(),
                 Some(Val::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
-                Some(Val::Str(_)) => vec!["0".to_string()],
+                Some(Val::Str(_)) | Some(Val::Int(_)) => vec!["0".to_string()],
                 _ => Vec::new(),
             };
             self.emit_pv(PV::List(keys, index.as_deref() == Some("@")), quoted, fb);
@@ -1167,6 +1227,24 @@ impl Shell {
     pub fn do_assign(&mut self, a: &Assign, local: bool, force_map: bool) -> Result<(), Flow> {
         match &a.value {
             AssignVal::Scalar(w) => {
+                // Fast path for `x=$((...))`: store integer natively without formatting.
+                if !a.append && a.index.is_none() {
+                    if let [WordPart::Arith(ca)] = w.as_slice() {
+                        return match self.eval_arith(ca)? {
+                            Num::I(n) => {
+                                if local {
+                                    self.store(&a.name, Val::Int(n), true)
+                                } else {
+                                    match self.set_i64(&a.name, n) {
+                                        Ok(()) => Ok(()),
+                                        Err(e) => self.fail(e),
+                                    }
+                                }
+                            }
+                            n => self.store(&a.name, Val::Str(n.fmt()), local),
+                        };
+                    }
+                }
                 let s = self.expand_word_str(w)?;
                 if let Some(idx) = &a.index {
                     if local && !self.scopes.last().unwrap().contains_key(&a.name) {
@@ -1180,6 +1258,7 @@ impl Shell {
                         // integer-looking append stays a string, as in sh
                         Val::Str(old + &s)
                     }
+                    Some(Val::Int(old)) => Val::Str(format!("{}{}", old, s)),
                     Some(Val::Arr(mut arr)) => {
                         if arr.is_empty() {
                             arr.push(s)
@@ -1203,9 +1282,15 @@ impl Shell {
                         let _ = self.set(&a.name, Val::Arr(Vec::new()));
                     }
                     if let Some(v) = self.var_mut(&a.name) {
-                        if let Val::Str(s) = &v.val {
-                            let s = s.clone();
-                            v.val = Val::Arr(vec![s]);
+                        match &v.val {
+                            Val::Str(s) => {
+                                let s = s.clone();
+                                v.val = Val::Arr(vec![s]);
+                            }
+                            Val::Int(n) => {
+                                v.val = Val::Arr(vec![n.to_string()]);
+                            }
+                            _ => {}
                         }
                         if !matches!(v.val, Val::Arr(_)) {
                             v.val = Val::Arr(Vec::new());
@@ -1255,6 +1340,7 @@ impl Shell {
                 let mut arr = match (a.append, cur) {
                     (true, Some(Val::Arr(v))) => v,
                     (true, Some(Val::Str(s))) => vec![s],
+                    (true, Some(Val::Int(n))) => vec![n.to_string()],
                     _ => Vec::new(),
                 };
                 for (key, w) in elems {

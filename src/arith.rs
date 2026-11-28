@@ -58,11 +58,107 @@ pub trait Env {
     fn get_fast(&mut self, name: &str, idx: Option<&str>) -> Option<Cow<'_, str>> {
         self.get(name, idx).map(Cow::Owned)
     }
+    fn get_int_fast(&self, _name: &str) -> Option<i64> {
+        None
+    }
+    fn add_i64_in_place(&mut self, _name: &str, _delta: i64) -> Option<Result<(i64, i64), String>> {
+        None
+    }
     fn set_num(&mut self, name: &str, idx: Option<&str>, val: Num) -> Result<(), String> {
         self.set(name, idx, val.fmt())
     }
     fn strict_arith(&self) -> bool { false }
     fn nounset(&self) -> bool { false }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div, Rem, Pow,
+    Shl, Shr, BitAnd, BitXor, BitOr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    LogAnd, LogOr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Neg, Pos, BitNot, LogNot,
+}
+
+#[derive(Clone, Debug)]
+pub enum ArithExpr {
+    Lit(Num),
+    Var(String),
+    ArrElem(String, String),
+    Unary(UnOp, Box<ArithExpr>),
+    Binary(BinOp, Box<ArithExpr>, Box<ArithExpr>),
+    Ternary(Box<ArithExpr>, Box<ArithExpr>, Box<ArithExpr>),
+    Comma(Vec<ArithExpr>),
+    Assign {
+        name: String,
+        idx: Option<String>,
+        op: Option<BinOp>,
+        rhs: Box<ArithExpr>,
+        rhs_pure: bool,
+    },
+    IncDec {
+        name: String,
+        idx: Option<String>,
+        inc: bool,
+        pre: bool,
+    },
+    Call(String, Vec<ArithExpr>),
+}
+
+impl ArithExpr {
+    /// Returns true if evaluating this expression cannot mutate any variable.
+    pub fn is_pure(&self) -> bool {
+        match self {
+            ArithExpr::Lit(_) | ArithExpr::Var(_) | ArithExpr::ArrElem(_, _) => true,
+            ArithExpr::Unary(_, e) => e.is_pure(),
+            ArithExpr::Binary(_, l, r) => l.is_pure() && r.is_pure(),
+            ArithExpr::Ternary(c, a, b) => c.is_pure() && a.is_pure() && b.is_pure(),
+            ArithExpr::Comma(es) => es.iter().all(ArithExpr::is_pure),
+            ArithExpr::Assign { .. } | ArithExpr::IncDec { .. } => false,
+            ArithExpr::Call(_, args) => args.iter().all(ArithExpr::is_pure),
+        }
+    }
+}
+
+/// A parsed shell arithmetic expression with an optional pre-compiled AST.
+/// Static expressions (no `$`, `` ` ``, `\`) are compiled once at parse time.
+#[derive(Clone, Debug)]
+pub struct CompiledArith {
+    pub raw: String,
+    pub compiled: Option<ArithExpr>,
+    pub empty: bool,
+}
+
+impl CompiledArith {
+    pub fn new(raw: String) -> CompiledArith {
+        let empty = raw.trim().is_empty();
+        let compiled = if !empty && !raw.contains(['$', '`', '\\']) {
+            compile(&raw)
+        } else {
+            None
+        };
+        CompiledArith { raw, compiled, empty }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    /// True if this arithmetic expression is guaranteed not to mutate shell variables.
+    pub fn is_pure(&self) -> bool {
+        if self.empty {
+            return true;
+        }
+        match &self.compiled {
+            Some(e) => e.is_pure(),
+            None => false,
+        }
+    }
 }
 
 type Lv<'a> = Option<(&'a str, Option<&'a str>)>;
@@ -681,6 +777,29 @@ impl<'a, 'e> Ev<'a, 'e> {
             let plain_assign = self.peek_byte() == Some(b'=') && self.bytes().get(self.pos + 1) != Some(&b'=');
             let v = if self.noeval > 0 || plain_assign {
                 Num::I(0)
+            } else if idx.is_none() {
+                if let Some(n) = self.env.get_int_fast(name) {
+                    return Ok((Num::I(n), Some((name, None))));
+                }
+                let eval_str: Option<String> = match self.env.get_fast(name, None) {
+                    None => {
+                        if self.nounset {
+                            return Err(format!("{}: unbound variable", name));
+                        }
+                        return Ok((Num::I(0), Some((name, None))));
+                    }
+                    Some(s) => match parse_number(&s, self.strict_arith) {
+                        Some(n) => return Ok((n, Some((name, None)))),
+                        None if s.trim().is_empty() => return Ok((Num::I(0), Some((name, None)))),
+                        None => {
+                            if self.strict_arith {
+                                return Err(format!("{}: invalid number", s));
+                            }
+                            Some(s.into_owned())
+                        }
+                    },
+                };
+                eval_depth(&eval_str.unwrap(), self.env, self.depth + 1)?
             } else {
                 let eval_str: Option<String> = match self.env.get_fast(name, idx) {
                     None => {
@@ -706,6 +825,578 @@ impl<'a, 'e> Ev<'a, 'e> {
         }
         let rest = &self.s[self.pos..];
         Err(format!("syntax error: operand expected (error token is \"{}\")", rest))
+    }
+}
+
+// ---------- Pre-compiled arithmetic AST ----------
+
+#[inline]
+fn apply_binop(op: BinOp, a: Num, b: Num) -> Result<Num, String> {
+    if let (Num::I(x), Num::I(y)) = (a, b) {
+        return Ok(match op {
+            BinOp::Add => Num::I(x.wrapping_add(y)),
+            BinOp::Sub => Num::I(x.wrapping_sub(y)),
+            BinOp::Mul => Num::I(x.wrapping_mul(y)),
+            BinOp::Div => {
+                if y == 0 {
+                    return Err("division by 0".into());
+                }
+                Num::I(x.wrapping_div(y))
+            }
+            BinOp::Rem => {
+                if y == 0 {
+                    return Err("division by 0".into());
+                }
+                Num::I(x.wrapping_rem(y))
+            }
+            BinOp::Pow => {
+                if y < 0 {
+                    return Err("negative exponent".into());
+                }
+                Num::I(ipow(x, y as u64))
+            }
+            BinOp::Eq => Num::I((x == y) as i64),
+            BinOp::Ne => Num::I((x != y) as i64),
+            BinOp::Lt => Num::I((x < y) as i64),
+            BinOp::Le => Num::I((x <= y) as i64),
+            BinOp::Gt => Num::I((x > y) as i64),
+            BinOp::Ge => Num::I((x >= y) as i64),
+            BinOp::BitOr => Num::I(x | y),
+            BinOp::BitXor => Num::I(x ^ y),
+            BinOp::BitAnd => Num::I(x & y),
+            BinOp::Shl => {
+                if y < 0 {
+                    return Err("negative shift".into());
+                }
+                Num::I(if y >= 64 { 0 } else { x.wrapping_shl(y as u32) })
+            }
+            BinOp::Shr => {
+                if y < 0 {
+                    return Err("negative shift".into());
+                }
+                Num::I(if y >= 64 { if x < 0 { -1 } else { 0 } } else { x.wrapping_shr(y as u32) })
+            }
+            BinOp::LogAnd | BinOp::LogOr => unreachable!(),
+        });
+    }
+    let op_str = match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Rem => "%",
+        BinOp::Pow => "**",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        BinOp::BitAnd => "&",
+        BinOp::BitXor => "^",
+        BinOp::BitOr => "|",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::LogAnd | BinOp::LogOr => unreachable!(),
+    };
+    binop(op_str, a, b)
+}
+
+#[inline]
+fn eval_var(name: &str, idx: Option<&str>, env: &mut dyn Env) -> Result<Num, String> {
+    if idx.is_none() {
+        if let Some(n) = env.get_int_fast(name) {
+            return Ok(Num::I(n));
+        }
+    }
+    let strict = env.strict_arith();
+    let nounset = env.nounset();
+    let eval_str = match env.get_fast(name, idx) {
+        None => {
+            if nounset {
+                return Err(format!("{}: unbound variable", name));
+            }
+            return Ok(Num::I(0));
+        }
+        Some(s) => match parse_number(&s, strict) {
+            Some(n) => return Ok(n),
+            None if s.trim().is_empty() => return Ok(Num::I(0)),
+            None => {
+                if strict {
+                    return Err(format!("{}: invalid number", s));
+                }
+                s.into_owned()
+            }
+        },
+    };
+    eval_depth(&eval_str, env, 1)
+}
+
+#[inline]
+pub fn eval_compiled(expr: &ArithExpr, env: &mut dyn Env) -> Result<Num, String> {
+    match expr {
+        ArithExpr::Lit(n) => {
+            if matches!(n, Num::F(_)) && env.strict_arith() {
+                return Err(format!("{}: invalid number", n.fmt()));
+            }
+            Ok(*n)
+        }
+        ArithExpr::Var(name) => {
+            if let Some(n) = env.get_int_fast(name) {
+                return Ok(Num::I(n));
+            }
+            eval_var(name, None, env)
+        }
+        ArithExpr::ArrElem(name, idx) => eval_var(name, Some(idx), env),
+        ArithExpr::Unary(op, inner) => {
+            let v = eval_compiled(inner, env)?;
+            Ok(match op {
+                UnOp::LogNot => Num::I(!v.truthy() as i64),
+                UnOp::BitNot => Num::I(!v.as_i()),
+                UnOp::Neg => match v {
+                    Num::I(i) => Num::I(i.wrapping_neg()),
+                    Num::F(f) => Num::F(-f),
+                },
+                UnOp::Pos => v,
+            })
+        }
+        ArithExpr::Binary(BinOp::LogAnd, l, r) => {
+            let lv = eval_compiled(l, env)?;
+            if !lv.truthy() {
+                return Ok(Num::I(0));
+            }
+            let rv = eval_compiled(r, env)?;
+            Ok(Num::I(rv.truthy() as i64))
+        }
+        ArithExpr::Binary(BinOp::LogOr, l, r) => {
+            let lv = eval_compiled(l, env)?;
+            if lv.truthy() {
+                return Ok(Num::I(1));
+            }
+            let rv = eval_compiled(r, env)?;
+            Ok(Num::I(rv.truthy() as i64))
+        }
+        ArithExpr::Binary(op, l, r) => {
+            let lv = eval_compiled(l, env)?;
+            let rv = eval_compiled(r, env)?;
+            apply_binop(*op, lv, rv)
+        }
+        ArithExpr::Ternary(c, a, b) => {
+            if eval_compiled(c, env)?.truthy() {
+                eval_compiled(a, env)
+            } else {
+                eval_compiled(b, env)
+            }
+        }
+        ArithExpr::Comma(es) => {
+            let mut v = Num::I(0);
+            for e in es {
+                v = eval_compiled(e, env)?;
+            }
+            Ok(v)
+        }
+        ArithExpr::IncDec { name, idx, inc, pre } => {
+            let delta = if *inc { 1 } else { -1 };
+            if idx.is_none() {
+                if let Some(res) = env.add_i64_in_place(name, delta) {
+                    let (old, new) = res?;
+                    return Ok(Num::I(if *pre { new } else { old }));
+                }
+            }
+            let v = eval_var(name, idx.as_deref(), env)?;
+            let nv = apply_binop(if *inc { BinOp::Add } else { BinOp::Sub }, v, Num::I(1))?;
+            env.set_num(name, idx.as_deref(), nv)?;
+            Ok(if *pre { nv } else { v })
+        }
+        ArithExpr::Assign { name, idx, op, rhs, rhs_pure } => match op {
+            None => {
+                let rv = eval_compiled(rhs, env)?;
+                env.set_num(name, idx.as_deref(), rv)?;
+                Ok(rv)
+            }
+            Some(op) => {
+                if *rhs_pure && idx.is_none() && matches!(op, BinOp::Add | BinOp::Sub) {
+                    let rv = eval_compiled(rhs, env)?;
+                    if let Num::I(delta_raw) = rv {
+                        let delta = if *op == BinOp::Add { delta_raw } else { delta_raw.wrapping_neg() };
+                        if let Some(res) = env.add_i64_in_place(name, delta) {
+                            let (_, new) = res?;
+                            return Ok(Num::I(new));
+                        }
+                    }
+                    let lv = eval_var(name, None, env)?;
+                    let nv = apply_binop(*op, lv, rv)?;
+                    env.set_num(name, None, nv)?;
+                    return Ok(nv);
+                }
+                let lv = eval_var(name, idx.as_deref(), env)?;
+                let rv = eval_compiled(rhs, env)?;
+                let nv = apply_binop(*op, lv, rv)?;
+                env.set_num(name, idx.as_deref(), nv)?;
+                Ok(nv)
+            }
+        },
+        ArithExpr::Call(name, args) => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_compiled(a, env)?);
+            }
+            call(name, &vals)
+        }
+    }
+}
+
+struct Compiler<'a> {
+    s: &'a str,
+    pos: usize,
+    depth: u32,
+}
+
+pub fn compile(expr: &str) -> Option<ArithExpr> {
+    let mut c = Compiler { s: expr, pos: 0, depth: 0 };
+    c.ws();
+    if c.pos >= c.s.len() {
+        return Some(ArithExpr::Lit(Num::I(0)));
+    }
+    let e = c.comma()?;
+    c.ws();
+    if c.pos < c.s.len() {
+        return None;
+    }
+    Some(e)
+}
+
+impl<'a> Compiler<'a> {
+    #[inline]
+    fn bytes(&self) -> &'a [u8] {
+        self.s.as_bytes()
+    }
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        self.bytes().get(self.pos).copied()
+    }
+    #[inline]
+    fn starts(&self, t: &str) -> bool {
+        self.bytes()[self.pos..].starts_with(t.as_bytes())
+    }
+    fn ws(&mut self) {
+        let bytes = self.bytes();
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                self.pos += 1;
+            } else if b >= 0x80 {
+                if let Some(c) = self.s[self.pos..].chars().next() {
+                    if c.is_whitespace() {
+                        self.pos += c.len_utf8();
+                        continue;
+                    }
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+    fn enter(&mut self) -> Option<()> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        Some(())
+    }
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    fn comma(&mut self) -> Option<ArithExpr> {
+        let first = self.assign()?;
+        self.ws();
+        if self.peek() != Some(b',') {
+            return Some(first);
+        }
+        let mut es = vec![first];
+        while self.peek() == Some(b',') {
+            self.pos += 1;
+            es.push(self.assign()?);
+            self.ws();
+        }
+        Some(ArithExpr::Comma(es))
+    }
+
+    fn peek_assign_op(&self) -> Option<(Option<BinOp>, usize)> {
+        let rem = &self.bytes()[self.pos..];
+        let b0 = *rem.first()?;
+        let b1 = rem.get(1).copied();
+        let b2 = rem.get(2).copied();
+        match (b0, b1, b2) {
+            (b'<', Some(b'<'), Some(b'=')) => Some((Some(BinOp::Shl), 3)),
+            (b'>', Some(b'>'), Some(b'=')) => Some((Some(BinOp::Shr), 3)),
+            (b'*', Some(b'*'), Some(b'=')) => Some((Some(BinOp::Pow), 3)),
+            (b'+', Some(b'='), _) => Some((Some(BinOp::Add), 2)),
+            (b'-', Some(b'='), _) => Some((Some(BinOp::Sub), 2)),
+            (b'*', Some(b'='), _) => Some((Some(BinOp::Mul), 2)),
+            (b'/', Some(b'='), _) => Some((Some(BinOp::Div), 2)),
+            (b'%', Some(b'='), _) => Some((Some(BinOp::Rem), 2)),
+            (b'&', Some(b'='), _) => Some((Some(BinOp::BitAnd), 2)),
+            (b'^', Some(b'='), _) => Some((Some(BinOp::BitXor), 2)),
+            (b'|', Some(b'='), _) => Some((Some(BinOp::BitOr), 2)),
+            (b'=', b, _) if b != Some(b'=') => Some((None, 1)),
+            _ => None,
+        }
+    }
+
+    fn assign(&mut self) -> Option<ArithExpr> {
+        self.enter()?;
+        let res = (|| {
+            let lhs = self.ternary()?;
+            self.ws();
+            if let Some((op, len)) = self.peek_assign_op() {
+                let (name, idx) = match lhs {
+                    ArithExpr::Var(n) => (n, None),
+                    ArithExpr::ArrElem(n, i) => (n, Some(i)),
+                    _ => return Some(lhs),
+                };
+                self.pos += len;
+                let rhs = self.assign()?;
+                let rhs_pure = rhs.is_pure();
+                return Some(ArithExpr::Assign {
+                    name,
+                    idx,
+                    op,
+                    rhs: Box::new(rhs),
+                    rhs_pure,
+                });
+            }
+            Some(lhs)
+        })();
+        self.leave();
+        res
+    }
+
+    fn ternary(&mut self) -> Option<ArithExpr> {
+        let c = self.binary(1)?;
+        self.ws();
+        if self.peek() != Some(b'?') {
+            return Some(c);
+        }
+        self.enter()?;
+        let res = (|| {
+            self.pos += 1;
+            let a = self.assign()?;
+            self.ws();
+            if self.peek() != Some(b':') {
+                return None;
+            }
+            self.pos += 1;
+            let b = self.ternary()?;
+            Some(ArithExpr::Ternary(Box::new(c), Box::new(a), Box::new(b)))
+        })();
+        self.leave();
+        res
+    }
+
+    fn peek_binop(&mut self) -> Option<(BinOp, u8, usize)> {
+        self.ws();
+        let rem = &self.bytes()[self.pos..];
+        let b0 = *rem.first()?;
+        let b1 = rem.get(1).copied();
+        let b2 = rem.get(2).copied();
+        let (op, prec, len, allow_eq) = match (b0, b1) {
+            (b'|', Some(b'|')) => (BinOp::LogOr, 1, 2, false),
+            (b'&', Some(b'&')) => (BinOp::LogAnd, 2, 2, false),
+            (b'*', Some(b'*')) => (BinOp::Pow, 11, 2, false),
+            (b'=', Some(b'=')) => (BinOp::Eq, 6, 2, true),
+            (b'!', Some(b'=')) => (BinOp::Ne, 6, 2, true),
+            (b'<', Some(b'<')) => (BinOp::Shl, 8, 2, false),
+            (b'>', Some(b'>')) => (BinOp::Shr, 8, 2, false),
+            (b'<', Some(b'=')) => (BinOp::Le, 7, 2, true),
+            (b'>', Some(b'=')) => (BinOp::Ge, 7, 2, true),
+            (b'|', _) => (BinOp::BitOr, 3, 1, false),
+            (b'^', _) => (BinOp::BitXor, 4, 1, false),
+            (b'&', _) => (BinOp::BitAnd, 5, 1, false),
+            (b'<', _) => (BinOp::Lt, 7, 1, false),
+            (b'>', _) => (BinOp::Gt, 7, 1, false),
+            (b'+', _) => (BinOp::Add, 9, 1, false),
+            (b'-', _) => (BinOp::Sub, 9, 1, false),
+            (b'*', _) => (BinOp::Mul, 10, 1, false),
+            (b'/', _) => (BinOp::Div, 10, 1, false),
+            (b'%', _) => (BinOp::Rem, 10, 1, false),
+            _ => return None,
+        };
+        let after = if len == 1 { b1 } else { b2 };
+        if after == Some(b'=') && !allow_eq {
+            return None;
+        }
+        Some((op, prec, len))
+    }
+
+    fn binary(&mut self, min: u8) -> Option<ArithExpr> {
+        let mut l = self.unary()?;
+        while let Some((op, prec, len)) = self.peek_binop() {
+            if prec < min {
+                break;
+            }
+            self.pos += len;
+            let r = self.binary(if op == BinOp::Pow { prec } else { prec + 1 })?;
+            l = ArithExpr::Binary(op, Box::new(l), Box::new(r));
+        }
+        Some(l)
+    }
+
+    fn unary(&mut self) -> Option<ArithExpr> {
+        self.ws();
+        let b0 = self.peek();
+        if matches!(b0, Some(b'+') | Some(b'-') | Some(b'!') | Some(b'~')) {
+            self.enter()?;
+            let res = (|| {
+                if self.starts("++") || self.starts("--") {
+                    let inc = b0 == Some(b'+');
+                    self.pos += 2;
+                    let inner = self.unary()?;
+                    return match inner {
+                        ArithExpr::Var(name) => Some(ArithExpr::IncDec { name, idx: None, inc, pre: true }),
+                        ArithExpr::ArrElem(name, idx) => Some(ArithExpr::IncDec { name, idx: Some(idx), inc, pre: true }),
+                        _ => None,
+                    };
+                }
+                self.pos += 1;
+                let inner = self.unary()?;
+                let op = match b0 {
+                    Some(b'!') => UnOp::LogNot,
+                    Some(b'~') => UnOp::BitNot,
+                    Some(b'-') => UnOp::Neg,
+                    Some(b'+') => UnOp::Pos,
+                    _ => unreachable!(),
+                };
+                Some(ArithExpr::Unary(op, Box::new(inner)))
+            })();
+            self.leave();
+            return res;
+        }
+        self.postfix()
+    }
+
+    fn postfix(&mut self) -> Option<ArithExpr> {
+        let p = self.primary()?;
+        self.ws();
+        if self.starts("++") || self.starts("--") {
+            let inc = self.peek() == Some(b'+');
+            let (name, idx) = match p {
+                ArithExpr::Var(n) => (n, None),
+                ArithExpr::ArrElem(n, i) => (n, Some(i)),
+                other => return Some(other),
+            };
+            self.pos += 2;
+            return Some(ArithExpr::IncDec { name, idx, inc, pre: false });
+        }
+        Some(p)
+    }
+
+    fn primary(&mut self) -> Option<ArithExpr> {
+        self.ws();
+        let b = self.peek()?;
+        if b == b'(' {
+            self.enter()?;
+            let res = (|| {
+                self.pos += 1;
+                let e = self.comma()?;
+                self.ws();
+                if self.peek() != Some(b')') {
+                    return None;
+                }
+                self.pos += 1;
+                Some(e)
+            })();
+            self.leave();
+            return res;
+        }
+        if b.is_ascii_digit() || b == b'.' {
+            let start = self.pos;
+            let bytes = self.bytes();
+            while let Some(&ch) = bytes.get(self.pos) {
+                if ch.is_ascii_alphanumeric() || ch == b'.' || ch == b'#' || ch == b'_' || ch == b'@' {
+                    self.pos += 1;
+                } else if (ch == b'-' || ch == b'+')
+                    && self.pos > start
+                    && matches!(bytes[self.pos - 1], b'e' | b'E')
+                    && !bytes[start..self.pos].starts_with(b"0x")
+                    && !bytes[start..self.pos].starts_with(b"0X")
+                    && bytes[start..self.pos - 1].iter().all(|x| x.is_ascii_digit() || *x == b'.')
+                    && bytes.get(self.pos + 1).map(|x| x.is_ascii_digit()).unwrap_or(false)
+                {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let t = &self.s[start..self.pos];
+            return parse_number(t, false).map(ArithExpr::Lit);
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = self.pos;
+            let bytes = self.bytes();
+            while let Some(&ch) = bytes.get(self.pos) {
+                if ch.is_ascii_alphanumeric() || ch == b'_' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let name = &self.s[start..self.pos];
+            if self.peek() == Some(b'(') {
+                self.enter()?;
+                let res = (|| {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    self.ws();
+                    if self.peek() == Some(b')') {
+                        self.pos += 1;
+                    } else {
+                        loop {
+                            args.push(self.assign()?);
+                            self.ws();
+                            if self.peek() == Some(b',') {
+                                self.pos += 1;
+                            } else if self.peek() == Some(b')') {
+                                self.pos += 1;
+                                break;
+                            } else {
+                                return None;
+                            }
+                        }
+                    }
+                    Some(ArithExpr::Call(name.to_string(), args))
+                })();
+                self.leave();
+                return res;
+            }
+            if self.peek() == Some(b'[') {
+                let mut depth = 0u32;
+                let st = self.pos + 1;
+                let mut j = st;
+                let bytes = self.bytes();
+                loop {
+                    match bytes.get(j) {
+                        None => return None,
+                        Some(b'[') => depth += 1,
+                        Some(b']') => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let idx = self.s[st..j].to_string();
+                self.pos = j + 1;
+                return Some(ArithExpr::ArrElem(name.to_string(), idx));
+            }
+            return Some(ArithExpr::Var(name.to_string()));
+        }
+        None
     }
 }
 

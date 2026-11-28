@@ -5,7 +5,6 @@ use crate::expand::shell_quote;
 use crate::parser::Parser;
 use crate::shell::*;
 use crate::sys::{self, WaitStatus};
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::rc::Rc;
 use std::time::Instant;
@@ -96,11 +95,18 @@ impl Shell {
         r
     }
 
+    #[inline]
     pub fn check_signals(&mut self) -> Result<(), Flow> {
         use std::sync::atomic::Ordering;
-        if !sys::ANY_PENDING.load(Ordering::SeqCst) {
+        if !sys::ANY_PENDING.load(Ordering::Relaxed) {
             return Ok(());
         }
+        self.check_signals_slow()
+    }
+
+    #[cold]
+    fn check_signals_slow(&mut self) -> Result<(), Flow> {
+        use std::sync::atomic::Ordering;
         sys::ANY_PENDING.store(false, Ordering::SeqCst);
         for sig in 1..65 {
             if !sys::take_pending(sig) {
@@ -139,17 +145,21 @@ impl Shell {
     }
 
     /// Apply errexit / `try` semantics to a finished command.
+    #[inline]
     fn after(&mut self, status: i32) -> R {
-        if status != 0 && self.cond_depth == 0 {
+        if status == 0 || self.cond_depth > 0 {
+            return Ok(status);
+        }
+        if !self.traps.is_empty() {
             if let Some(t) = self.traps.get(&ERR_TRAP).cloned() {
                 self.run_trap(&t)?;
             }
-            if self.try_depth > 0 {
-                return Err(Flow::Throw(status));
-            }
-            if self.opts.errexit {
-                return Err(Flow::Exit(status));
-            }
+        }
+        if self.try_depth > 0 {
+            return Err(Flow::Throw(status));
+        }
+        if self.opts.errexit {
+            return Err(Flow::Exit(status));
         }
         Ok(status)
     }
@@ -198,8 +208,8 @@ impl Shell {
                 let mut st = 0;
                 for it in items {
                     self.check_signals()?;
-                    if let Some(t) = &it.text {
-                        if !self.is_child && !it.bg {
+                    if self.job_control && !self.is_child && !it.bg {
+                        if let Some(t) = &it.text {
                             self.cur_text = t.clone();
                         }
                     }
@@ -318,20 +328,20 @@ impl Shell {
                 Ok(status)
             }
             Cmd::CFor { init, cond, step, body } => {
-                if !init.trim().is_empty() {
-                    self.arith(init)?;
+                if !init.is_empty() {
+                    self.eval_arith(init)?;
                 }
                 let mut status = 0;
                 loop {
                     self.check_signals()?;
-                    if !cond.trim().is_empty() && !self.arith(cond)?.truthy() {
+                    if !cond.is_empty() && !self.eval_arith(cond)?.truthy() {
                         break;
                     }
                     if self.loop_iter(body, &mut status)? {
                         break;
                     }
-                    if !step.trim().is_empty() {
-                        self.arith(step)?;
+                    if !step.is_empty() {
+                        self.eval_arith(step)?;
                     }
                 }
                 Ok(status)
@@ -370,8 +380,8 @@ impl Shell {
                 let b = self.eval_cond(e)?;
                 self.after(!b as i32)
             }
-            Cmd::Arith(raw) => {
-                let n = self.arith(raw)?;
+            Cmd::Arith(ca) => {
+                let n = self.eval_arith(ca)?;
                 self.after(!n.truthy() as i32)
             }
             Cmd::Try { body, catch } => {
@@ -765,8 +775,9 @@ impl Shell {
     }
 
     pub fn cmd_subst(&mut self, cmd: &Cmd) -> Result<String, Flow> {
+        let simple = unwrap_simple_cmd(cmd);
         // $(< file)
-        if let Cmd::Simple(sc) = cmd {
+        if let Some(sc) = simple {
             if sc.words.is_empty() && sc.assigns.is_empty() && sc.redirs.len() == 1 && matches!(sc.redirs[0].kind, RedirKind::In) {
                 let path = self.expand_word_str(&sc.redirs[0].target)?;
                 return match std::fs::read(&path) {
@@ -780,6 +791,14 @@ impl Shell {
                         Ok(String::new())
                     }
                 };
+            }
+            // Fast path: pure side-effect-free builtins run directly in-process without fork/pipe.
+            if let Some(res) = self.try_cmd_subst_builtin(sc) {
+                return res;
+            }
+            // Fast path: simple external command spawned via posix_spawn (vfork/clone) instead of fork.
+            if let Some(res) = self.try_cmd_subst_external(sc) {
+                return res;
             }
         }
         let (r, w) = match sys::pipe() {
@@ -808,6 +827,206 @@ impl Shell {
         let n = s.trim_end_matches('\n').len();
         s.truncate(n);
         Ok(s)
+    }
+
+    fn try_cmd_subst_builtin(&mut self, sc: &SimpleCmd) -> Option<Result<String, Flow>> {
+        if !sc.assigns.is_empty() || !sc.redirs.is_empty() {
+            return None;
+        }
+        let name = sc.words.first().and_then(word_literal_str)?;
+        if !matches!(name, "echo" | "printf" | ":" | "true" | "false" | "pwd") {
+            return None;
+        }
+        if self.funcs.contains_key(name) {
+            return None;
+        }
+        if !sc.words[1..].iter().all(word_is_pure) {
+            return None;
+        }
+        let saved_lineno = self.lineno;
+        self.lineno = sc.line;
+        if let Err(e) = self.check_signals() {
+            self.lineno = saved_lineno;
+            return Some(Err(e));
+        }
+        // Fast path for `echo <single literal>` without even allocating a Vec<String>
+        if name == "echo" && sc.words.len() == 2 && !self.opts.xtrace {
+            if let Some(lit) = word_literal_str(&sc.words[1]) {
+                if !lit.starts_with('-') && !lit.contains(['{', '*', '?', '[']) && !lit.contains("@(") && !lit.contains("+(") && !lit.contains("!(") {
+                    self.lineno = saved_lineno;
+                    self.last_subst = Some(0);
+                    self.last_status = 0;
+                    let mut s = lit.to_string();
+                    if s.contains('\0') {
+                        s = s.replace('\0', "");
+                    }
+                    let n = s.trim_end_matches('\n').len();
+                    s.truncate(n);
+                    return Some(Ok(s));
+                }
+            }
+        }
+        let mut args = Vec::with_capacity(sc.words.len().saturating_sub(1));
+        for w in &sc.words[1..] {
+            match self.expand_word_into(w, &mut args) {
+                Ok(()) => {}
+                Err(Flow::Abort(s)) | Err(Flow::Exit(s)) => {
+                    self.lineno = saved_lineno;
+                    self.last_subst = Some(s);
+                    self.last_status = s;
+                    return Some(Ok(String::new()));
+                }
+                Err(e) => {
+                    self.lineno = saved_lineno;
+                    return Some(Err(e));
+                }
+            }
+        }
+        if name == "printf" && args.len() >= 2 && args[0] == "-v" {
+            self.lineno = saved_lineno;
+            return None;
+        }
+        if self.opts.xtrace {
+            let mut parts = Vec::with_capacity(args.len() + 1);
+            parts.push(shell_quote(name));
+            for a in &args {
+                parts.push(shell_quote(a));
+            }
+            self.xtrace(&parts.join(" "));
+        }
+        let (mut s, st) = match name {
+            ":" | "true" => (String::new(), 0),
+            "false" => (String::new(), 1),
+            "pwd" => {
+                let p = if args.first().map(|a| a == "-P").unwrap_or(false) {
+                    std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+                } else {
+                    self.cwd()
+                };
+                (p, 0)
+            }
+            "echo" => {
+                let mut esc = false;
+                let mut i = 0;
+                while i < args.len() {
+                    let a = &args[i];
+                    if a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
+                        for c in a[1..].chars() {
+                            match c {
+                                'e' => esc = true,
+                                'E' => esc = false,
+                                _ => {}
+                            }
+                        }
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut out = args[i..].join(" ");
+                if esc {
+                    let (t, _) = crate::builtins::unescape(&out);
+                    out = t;
+                }
+                (out, 0)
+            }
+            "printf" => {
+                let mut a = args.as_slice();
+                if !a.is_empty() && a[0] == "--" {
+                    a = &a[1..];
+                }
+                if a.is_empty() {
+                    sherr!("printf: usage: printf [-v var] format [arguments]");
+                    (String::new(), 2)
+                } else {
+                    let (out, ok) = crate::builtins::printf_format(&a[0], &a[1..]);
+                    (out, !ok as i32)
+                }
+            }
+            _ => unreachable!(),
+        };
+        self.lineno = saved_lineno;
+        if s.contains('\0') {
+            s = s.replace('\0', "");
+        }
+        let n = s.trim_end_matches('\n').len();
+        s.truncate(n);
+        self.last_subst = Some(st);
+        self.last_status = st;
+        Some(Ok(s))
+    }
+
+    fn try_cmd_subst_external(&mut self, sc: &SimpleCmd) -> Option<Result<String, Flow>> {
+        if !sc.assigns.is_empty() || !sc.redirs.is_empty() || self.opts.autocd || self.opts.xtrace || self.scopes.len() != 1 {
+            return None;
+        }
+        let name = sc.words.first().and_then(word_literal_str)?;
+        if self.funcs.contains_key(name) || crate::builtins::is_builtin(name) {
+            return None;
+        }
+        if !sc.words.iter().all(word_is_pure) {
+            return None;
+        }
+        let saved_lineno = self.lineno;
+        self.lineno = sc.line;
+        if let Err(e) = self.check_signals() {
+            self.lineno = saved_lineno;
+            return Some(Err(e));
+        }
+        let mut argv = Vec::with_capacity(sc.words.len());
+        for w in &sc.words {
+            match self.expand_word_into(w, &mut argv) {
+                Ok(()) => {}
+                Err(Flow::Abort(s)) | Err(Flow::Exit(s)) => {
+                    self.lineno = saved_lineno;
+                    self.last_subst = Some(s);
+                    self.last_status = s;
+                    return Some(Ok(String::new()));
+                }
+                Err(e) => {
+                    self.lineno = saved_lineno;
+                    return Some(Err(e));
+                }
+            }
+        }
+        self.lineno = saved_lineno;
+        if argv.is_empty() {
+            return None;
+        }
+        let path = if argv[0].contains('/') {
+            argv[0].clone()
+        } else {
+            self.find_command(&argv[0])?
+        };
+        let (r, w) = sys::pipe()?;
+        let cpath = to_cstring(&path);
+        let cargs: Vec<CString> = argv.iter().map(|a| to_cstring(a)).collect();
+        let mut pargs: Vec<*const libc::c_char> = cargs.iter().map(|a| a.as_ptr()).collect();
+        pargs.push(std::ptr::null());
+        let mut reset_buf = [0i32; 72];
+        let reset_len = self.fill_reset_sigs(&mut reset_buf);
+        let envp = self.cached_envp();
+        let pid = match sys::posix_spawn(&cpath, &pargs, envp, &reset_buf[..reset_len], Some((r, w))) {
+            Ok(pid) => pid,
+            Err(_) => {
+                sys::close(r);
+                sys::close(w);
+                return None;
+            }
+        };
+        sys::close(w);
+        let bytes = sys::read_all(r);
+        sys::close(r);
+        let st = self.wait_pid(pid);
+        self.last_subst = Some(st);
+        self.last_status = st;
+        let mut s = String::from_utf8_lossy(&bytes).into_owned();
+        if s.contains('\0') {
+            s = s.replace('\0', "");
+        }
+        let n = s.trim_end_matches('\n').len();
+        s.truncate(n);
+        Some(Ok(s))
     }
 
     pub fn wait_pid(&mut self, pid: i32) -> i32 {
@@ -1037,6 +1256,21 @@ impl Shell {
                 return r;
             }
         }
+        if sc.assigns.is_empty() && sc.redirs.is_empty() && !self.opts.xtrace && sc.words.len() == 1 {
+            if let Some(lit) = word_literal_str(&sc.words[0]) {
+                if !lit.contains(['{', '*', '?', '[']) && !lit.contains("@(") && !lit.contains("+(") && !lit.contains("!(") {
+                    if !self.funcs.contains_key(lit) {
+                        if crate::builtins::is_builtin(lit) && lit != "exec" {
+                            let one = [lit.to_string()];
+                            return self.run_builtin(lit, &one);
+                        }
+                        if !direct && !self.job_control && !self.opts.autocd && self.scopes.len() == 1 && !crate::builtins::is_builtin(lit) {
+                            return self.spawn_external_noargs(lit);
+                        }
+                    }
+                }
+            }
+        }
         let argv = self.expand_words(&sc.words)?;
         if argv.is_empty() {
             let mut saved = Vec::new();
@@ -1056,7 +1290,7 @@ impl Shell {
         }
         // Fast path for simple builtin commands without assignments/redirections.
         if sc.assigns.is_empty() && sc.redirs.is_empty() {
-            if crate::builtins::is_builtin(&argv[0]) && argv[0] != "exec" {
+            if crate::builtins::is_builtin(&argv[0]) && argv[0] != "exec" && !self.funcs.contains_key(&argv[0]) {
                 if self.opts.xtrace {
                     let line = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
                     self.xtrace(&line);
@@ -1098,7 +1332,7 @@ impl Shell {
         }
         let pushed = !assigns.is_empty();
         if pushed {
-            self.scopes.push(HashMap::new());
+            self.scopes.push(fx_map());
             for a in assigns {
                 if let Err(e) = self.do_assign(a, true, false) {
                     self.scopes.pop();
@@ -1171,6 +1405,117 @@ impl Shell {
         Ok(env)
     }
 
+    fn fill_reset_sigs(&self, buf: &mut [i32; 72]) -> usize {
+        let mut n = 0;
+        if self.interactive {
+            for s in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU, libc::SIGTERM, libc::SIGWINCH] {
+                buf[n] = s;
+                n += 1;
+            }
+        }
+        if !self.traps.is_empty() {
+            for (&sig, cmd) in &self.traps {
+                if sig > 0 && !cmd.is_empty() && n < buf.len() {
+                    buf[n] = sig;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn wait_single(&mut self, pid: i32) -> R {
+        loop {
+            let st = match sys::waitpid_status(pid, 0) {
+                Some(s) => s,
+                None => {
+                    if sys::errno() == sys::EINTR {
+                        self.check_signals()?;
+                        continue;
+                    }
+                    return Ok(127);
+                }
+            };
+            match sys::decode_status(st) {
+                WaitStatus::Exited(c) => return Ok(c),
+                WaitStatus::Signaled(s) => {
+                    if s == libc::SIGINT && self.interactive {
+                        err!("\n");
+                        self.last_status = 130;
+                        return Err(Flow::Interrupt);
+                    }
+                    if s != libc::SIGINT {
+                        let d = sys::sig_description(s);
+                        if !d.is_empty() && !self.is_child {
+                            err!("{}\n", d);
+                        }
+                    }
+                    return Ok(128 + s);
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Zero-allocation fast path for spawning a single-word external command (e.g. `/bin/true`)
+    /// with no arguments, redirections, job control, or extra environment variables.
+    fn spawn_external_noargs(&mut self, name: &str) -> R {
+        let mut from_hash = false;
+        let path_owned;
+        let path: &str = if name.contains('/') {
+            name
+        } else if let Some(p) = self.hash.get(name) {
+            from_hash = true;
+            path_owned = p.clone();
+            &path_owned
+        } else {
+            match self.find_command(name) {
+                Some(p) => {
+                    path_owned = p;
+                    &path_owned
+                }
+                None => return self.command_not_found(&[name.to_string()]),
+            }
+        };
+        let mut reset_buf = [0i32; 72];
+        let reset_len = self.fill_reset_sigs(&mut reset_buf);
+        let cpath = to_cstring(path);
+        let cname = if path == name { None } else { Some(to_cstring(name)) };
+        let arg0_ptr = cname.as_ref().unwrap_or(&cpath).as_ptr();
+        let pargs = [arg0_ptr, std::ptr::null()];
+        let spawn_res = {
+            let envp = self.cached_envp();
+            sys::posix_spawn(&cpath, &pargs, envp, &reset_buf[..reset_len], None)
+        };
+        match spawn_res {
+            Ok(pid) => self.wait_single(pid),
+            Err(e) => {
+                if from_hash && (e == libc::ENOENT || e == libc::EACCES) {
+                    self.hash.remove(name);
+                    return self.run_external(vec![name.to_string()], &[], &[], false);
+                }
+                if e == libc::ENOEXEC {
+                    let cme = to_cstring(&self.self_exe);
+                    let cnash = to_cstring("nash");
+                    let sargs = [cnash.as_ptr(), cpath.as_ptr(), std::ptr::null()];
+                    let envp = self.cached_envp();
+                    if let Ok(pid) = sys::posix_spawn(&cme, &sargs, envp, &reset_buf[..reset_len], None) {
+                        return self.wait_single(pid);
+                    }
+                }
+                if e == libc::ENOENT && name.contains('/') {
+                    return self.command_not_found(&[name.to_string()]);
+                }
+                if sys::is_dir(path) {
+                    sherr!("{}: Is a directory", name);
+                    return Ok(126);
+                }
+                sherr!("{}: {}", name, sys::strerror(e));
+                Ok(if e == libc::ENOENT { 127 } else { 126 })
+            }
+        }
+    }
+
     fn run_external(&mut self, argv: Vec<String>, assigns: &[Assign], redirs: &[Redir], direct: bool) -> R {
         let env = self.assign_env(assigns)?;
         let name = &argv[0];
@@ -1184,9 +1529,16 @@ impl Shell {
                 return self.run_builtin("cd", &["cd".to_string(), name.clone()]);
             }
         }
-        let path = match env.iter().find(|(k, _)| k == "PATH") {
-            Some((_, p)) if !name.contains('/') => p.split(':').map(|d| format!("{}/{}", if d.is_empty() { "." } else { d }, name)).find(|f| sys::is_executable(f)),
-            _ => self.find_command(name),
+        let has_custom_path = env.iter().any(|(k, _)| k == "PATH");
+        let mut from_hash = false;
+        let path = if has_custom_path && !name.contains('/') {
+            let p = env.iter().find(|(k, _)| k == "PATH").unwrap().1.as_str();
+            p.split(':').map(|d| format!("{}/{}", if d.is_empty() { "." } else { d }, name)).find(|f| sys::is_executable(f))
+        } else if name.contains('/') && !direct && !self.job_control && redirs.is_empty() {
+            Some(name.clone())
+        } else {
+            from_hash = !name.contains('/') && self.hash.contains_key(name);
+            self.find_command(name)
         };
         let path = match path {
             Some(p) => p,
@@ -1209,8 +1561,79 @@ impl Shell {
             }
             self.do_exec(&path, &argv, &env);
         }
+        if !self.job_control && redirs.is_empty() {
+            let cpath = to_cstring(&path);
+            let cargs: Vec<CString> = argv.iter().map(|a| to_cstring(a)).collect();
+            let mut pargs: Vec<*const libc::c_char> = cargs.iter().map(|a| a.as_ptr()).collect();
+            pargs.push(std::ptr::null());
+            let mut reset_buf = [0i32; 72];
+            let reset_len = self.fill_reset_sigs(&mut reset_buf);
+            let custom_cenv: Vec<CString>;
+            let mut custom_penv: Vec<*const libc::c_char>;
+            let use_cached = self.scopes.len() == 1 && env.is_empty();
+            let spawn_res = if use_cached {
+                let envp = self.cached_envp();
+                sys::posix_spawn(&cpath, &pargs, envp, &reset_buf[..reset_len], None)
+            } else {
+                let mut m = self.environ();
+                for (k, v) in &env {
+                    m.insert(k.clone(), v.clone());
+                }
+                custom_cenv = m.iter().map(|(k, v)| make_env_cs(k, v)).collect();
+                custom_penv = custom_cenv.iter().map(|a| a.as_ptr()).collect();
+                custom_penv.push(std::ptr::null());
+                sys::posix_spawn(&cpath, &pargs, &custom_penv, &reset_buf[..reset_len], None)
+            };
+            match spawn_res {
+                Ok(pid) => return self.wait_single(pid),
+                Err(e) => {
+                    if from_hash && (e == libc::ENOENT || e == libc::EACCES) {
+                        self.hash.remove(&argv[0]);
+                        return self.run_external(argv, assigns, redirs, direct);
+                    }
+                    if e == libc::ENOEXEC {
+                        let cme = to_cstring(&self.self_exe);
+                        let mut sargs: Vec<CString> = Vec::with_capacity(argv.len() + 1);
+                        sargs.push(to_cstring("nash"));
+                        sargs.push(cpath.clone());
+                        sargs.extend(argv[1..].iter().map(|a| to_cstring(a)));
+                        let mut p: Vec<*const libc::c_char> = sargs.iter().map(|a| a.as_ptr()).collect();
+                        p.push(std::ptr::null());
+                        let enoexec_res = if use_cached {
+                            let envp = self.cached_envp();
+                            sys::posix_spawn(&cme, &p, envp, &reset_buf[..reset_len], None)
+                        } else {
+                            let mut m = self.environ();
+                            for (k, v) in &env {
+                                m.insert(k.clone(), v.clone());
+                            }
+                            let ce: Vec<CString> = m.iter().map(|(k, v)| make_env_cs(k, v)).collect();
+                            let mut pe: Vec<*const libc::c_char> = ce.iter().map(|a| a.as_ptr()).collect();
+                            pe.push(std::ptr::null());
+                            sys::posix_spawn(&cme, &p, &pe, &reset_buf[..reset_len], None)
+                        };
+                        if let Ok(pid) = enoexec_res {
+                            return self.wait_single(pid);
+                        }
+                    }
+                    if e == libc::ENOENT && argv[0].contains('/') {
+                        return self.command_not_found(&argv);
+                    }
+                    if sys::is_dir(&path) {
+                        sherr!("{}: Is a directory", argv[0]);
+                        return Ok(126);
+                    }
+                    sherr!("{}: {}", argv[0], sys::strerror(e));
+                    return Ok(if e == libc::ENOENT { 127 } else { 126 });
+                }
+            }
+        }
         let jc = self.job_control;
-        let text = if self.cur_text.is_empty() { argv.join(" ") } else { self.cur_text.clone() };
+        let text = if jc {
+            if self.cur_text.is_empty() { argv.join(" ") } else { self.cur_text.clone() }
+        } else {
+            String::new()
+        };
         let pid = self.fork()?;
         if pid == 0 {
             self.child_setup(jc, 0, true);
@@ -1287,6 +1710,7 @@ impl Shell {
                 .iter()
                 .filter_map(|(k, v)| match &v.val {
                     Val::Str(val) if v.exported => Some(make_env(k, val)),
+                    Val::Int(n) if v.exported => Some(make_env(k, &n.to_string())),
                     _ => None,
                 })
                 .collect()
@@ -1331,7 +1755,7 @@ impl Shell {
             sherr!("{}: maximum function nesting level exceeded", f.name);
             return Err(Flow::Abort(1));
         }
-        self.scopes.push(HashMap::new());
+        self.scopes.push(fx_map());
         if let Some(params) = &f.params {
             let usage = || {
                 let mut u = f.name.clone();
@@ -1434,6 +1858,7 @@ impl Shell {
         let dq = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`"));
         match &v.val {
             Val::Unset => format!("declare -{} {}", flags, name),
+            Val::Int(i) => format!("declare -{} {}=\"{}\"", flags, name, i),
             Val::Str(s) => format!("declare -{} {}={}", flags, name, dq(s)),
             Val::Arr(a) => format!("declare -{} {}=({})", flags, name, a.iter().enumerate().map(|(i, s)| format!("[{}]={}", i, dq(s))).collect::<Vec<_>>().join(" ")),
             Val::Map(m) => format!("declare -{} {}=({})", flags, name, m.iter().map(|(k, s)| format!("[{}]={}", shell_quote(k), dq(s))).collect::<Vec<_>>().join(" ")),
@@ -1559,6 +1984,7 @@ impl Shell {
                     if cmd == "export" {
                         match &v.val {
                             Val::Str(s) => out!("export {}={}\n", n, shell_quote(s)),
+                            Val::Int(i) => out!("export {}='{}'\n", n, i),
                             _ => out!("export {}\n", n),
                         };
                     } else {
@@ -1638,6 +2064,7 @@ impl Shell {
                 if let Some(v) = self.var_mut(&name) {
                     v.exported = false;
                 }
+                self.env_dirty = true;
             } else if export {
                 self.export_var(&name);
             }
@@ -1651,5 +2078,77 @@ impl Shell {
             }
         }
         Ok(status)
+    }
+}
+
+#[inline]
+fn to_cstring(s: &str) -> CString {
+    if !s.as_bytes().contains(&0) {
+        CString::new(s).unwrap()
+    } else {
+        CString::new(s.replace('\0', "")).unwrap()
+    }
+}
+
+fn make_env_cs(k: &str, v: &str) -> CString {
+    let mut buf = Vec::with_capacity(k.len() + 1 + v.len());
+    for &b in k.as_bytes() {
+        if b != 0 {
+            buf.push(b);
+        }
+    }
+    buf.push(b'=');
+    for &b in v.as_bytes() {
+        if b != 0 {
+            buf.push(b);
+        }
+    }
+    CString::new(buf).unwrap()
+}
+
+fn unwrap_simple_cmd(mut cmd: &Cmd) -> Option<&SimpleCmd> {
+    loop {
+        match cmd {
+            Cmd::Simple(sc) => return Some(sc),
+            Cmd::List(items) if items.len() == 1 && !items[0].bg => cmd = &items[0].cmd,
+            Cmd::Pipeline { cmds, negate: false, timed: false } if cmds.len() == 1 => cmd = &cmds[0],
+            Cmd::Group(inner) => cmd = inner,
+            _ => return None,
+        }
+    }
+}
+
+fn word_is_pure(w: &Word) -> bool {
+    w.iter().all(word_part_is_pure)
+}
+
+fn word_part_is_pure(p: &WordPart) -> bool {
+    match p {
+        WordPart::Lit(_) | WordPart::Quoted(_) | WordPart::Tilde(_) => true,
+        WordPart::DQuote(inner) => inner.iter().all(word_part_is_pure),
+        WordPart::Arith(ca) => ca.is_pure(),
+        // Nested command substitutions preserve parent state on their own.
+        WordPart::CmdSubst(_) => true,
+        WordPart::Param(pe) => {
+            if pe.name == "RANDOM" {
+                return false;
+            }
+            if let Some(idx) = &pe.index {
+                if idx.contains('=') || idx.contains("++") || idx.contains("--") {
+                    return false;
+                }
+            }
+            match &pe.op {
+                ParamOp::Plain | ParamOp::Length | ParamOp::Keys | ParamOp::Case { .. } | ParamOp::Transform(_) => true,
+                ParamOp::Assign(_, _) => false,
+                ParamOp::Default(_, w) | ParamOp::Alt(_, w) | ParamOp::Error(_, w) | ParamOp::TrimPrefix(_, w) | ParamOp::TrimSuffix(_, w) => word_is_pure(w),
+                ParamOp::Replace { pat, rep, .. } => word_is_pure(pat) && word_is_pure(rep),
+                ParamOp::Substr(off, len) => {
+                    let ok = |s: &str| !s.contains('=') && !s.contains("++") && !s.contains("--");
+                    ok(off) && len.as_deref().map(ok).unwrap_or(true)
+                }
+            }
+        }
+        WordPart::ProcSubst(_, _) | WordPart::Assign(_) => false,
     }
 }

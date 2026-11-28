@@ -170,7 +170,7 @@ struct Editor<'a> {
     kill: Vec<char>,
     search: Option<(String, Option<usize>)>,
     cwd: String,
-    ls: crate::colors::LsColors,
+    ls: Option<crate::colors::LsColors>,
 }
 
 const GIT_CMDS: &[&str] = &[
@@ -791,6 +791,10 @@ impl<'a> Editor<'a> {
         if hits.is_empty() && !prefix.is_empty() {
             hits = entries.iter().filter(|(n, _)| n.to_lowercase().contains(&lp)).collect();
         }
+        if self.ls.is_none() {
+            self.ls = Some(crate::colors::LsColors::parse(&self.sh.get("LS_COLORS").unwrap_or_default()));
+        }
+        let ls = self.ls.as_ref().unwrap();
         hits.into_iter()
             .map(|(name, is_dir)| {
                 let mut text = match quote {
@@ -805,7 +809,7 @@ impl<'a> Editor<'a> {
                     text.push('/');
                     display.push('/');
                 }
-                let color = self.ls.color_for(&format!("{}/{}", dir_real.trim_end_matches('/'), name), name);
+                let color = ls.color_for(&format!("{}/{}", dir_real.trim_end_matches('/'), name), name);
                 Cand { text, display, dir: *is_dir, color }
             })
             .collect()
@@ -945,6 +949,7 @@ impl<'a> Editor<'a> {
                             match &v.val {
                                 crate::shell::Val::Arr(a) => reply = a.clone(),
                                 crate::shell::Val::Str(s) => reply = s.split_whitespace().map(|x| x.to_string()).collect(),
+                                crate::shell::Val::Int(n) => reply = vec![n.to_string()],
                                 _ => {}
                             }
                         }
@@ -1419,7 +1424,6 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
     intro.push_str(head);
     sys::write_fd(2, intro.as_bytes());
     let cwd = sh.cwd();
-    let ls = crate::colors::LsColors::parse(&sh.get("LS_COLORS").unwrap_or_default());
     let mut ed = Editor {
         sh,
         prompt: last.to_string(),
@@ -1442,7 +1446,7 @@ pub fn read_line(sh: &mut Shell, prompt: &str, rprompt: &str) -> Input {
         kill: Vec::new(),
         search: None,
         cwd,
-        ls,
+        ls: None,
     };
     ed.refresh();
     let r = ed.run();
@@ -1513,7 +1517,7 @@ mod tests {
             kill: Vec::new(),
             search: None,
             cwd: "/".to_string(),
-            ls: crate::colors::LsColors::parse(""),
+            ls: None,
         }
     }
 
