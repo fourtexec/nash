@@ -46,6 +46,8 @@ options:
   --check        only check if an update is available (exit 0: up to date, 1: update available)
   --force        reinstall even if this version is already installed
   --list         list releases available for this platform
+  --chsh         also register nash in /etc/shells and set it as login shell
+  --no-chsh      do not update /etc/shells or the login shell
   -h, --help     show this help
 ";
 
@@ -57,12 +59,45 @@ Removes the installed nash binary, managed rc blocks, and /etc/shells entries.
 
 fn user_home() -> (String, String) {
     let (user, pw_home) = sys::current_user();
-    let home = std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or(pw_home)
-        .unwrap_or_else(|| "/".into());
+    let sudo_active = sys::geteuid() == 0
+        && std::env::var("SUDO_USER")
+            .map(|u| !u.is_empty() && u != "root")
+            .unwrap_or(false);
+    let home = if sudo_active {
+        pw_home
+            .or_else(|| std::env::var("HOME").ok().filter(|h| !h.is_empty()))
+            .unwrap_or_else(|| "/".into())
+    } else {
+        std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .or(pw_home)
+            .unwrap_or_else(|| "/".into())
+    };
     (user, home)
+}
+
+fn same_file(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (Path::new(a).canonicalize(), Path::new(b).canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a.trim_end_matches('/') == b.trim_end_matches('/'),
+    }
+}
+
+fn is_nash_shell_path(path: &str) -> bool {
+    let t = path.trim();
+    t == "nash" || t.ends_with("/nash")
+}
+
+fn parent_writable(path: &str) -> bool {
+    Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(sys::writable_dir)
+        .unwrap_or(false)
 }
 
 fn is_android_termux() -> bool {
@@ -87,14 +122,19 @@ fn default_bindir(prefix: Option<&str>, home: &str) -> String {
     }
 }
 
-/// Locate an existing installed `nash` binary.
-fn find_installed_nash(prefix: Option<&str>, home: &str) -> Option<String> {
+/// Locate an existing installed `nash` binary (checking `PATH`, configured login
+/// shell, and standard install locations).
+fn find_installed_nash(prefix: Option<&str>, home: &str, user: &str) -> Option<String> {
     if let Some(p) = prefix {
         let cand = format!("{}/bin/nash", p.trim_end_matches('/'));
         return sys::is_executable(&cand).then_some(cand);
     }
     if let Some(found) = sys::find_in_path("nash") {
         return Some(found);
+    }
+    let login = sys::get_login_shell_for(user);
+    if is_nash_shell_path(&login) && sys::is_executable(&login) {
+        return Some(login);
     }
     let mut cands = vec![
         format!("{}/.local/bin/nash", home.trim_end_matches('/')),
@@ -107,6 +147,34 @@ fn find_installed_nash(prefix: Option<&str>, home: &str) -> Option<String> {
     }
     cands.push("/data/data/com.termux/files/usr/bin/nash".to_string());
     cands.into_iter().find(|c| sys::is_executable(c))
+}
+
+/// Choose `(bindir, dest)` for `nashed install`. If no `--prefix` is given and
+/// an existing `nash` binary (login shell or in `PATH`) is writable, reuse its
+/// directory so `nashed install` updates it in place instead of creating a
+/// second copy.
+fn choose_install_dest(prefix: Option<&str>, home: &str, user: &str) -> (String, String) {
+    if let Some(p) = prefix {
+        let bindir = default_bindir(Some(p), home);
+        let dest = format!("{}/nash", bindir.trim_end_matches('/'));
+        return (bindir, dest);
+    }
+    let login = sys::get_login_shell_for(user);
+    if is_nash_shell_path(&login) && sys::is_executable(&login) && parent_writable(&login) {
+        if let Some(dir) = Path::new(&login).parent().and_then(|p| p.to_str()) {
+            return (dir.to_string(), login);
+        }
+    }
+    if let Some(found) = sys::find_in_path("nash") {
+        if parent_writable(&found) {
+            if let Some(dir) = Path::new(&found).parent().and_then(|p| p.to_str()) {
+                return (dir.to_string(), found);
+            }
+        }
+    }
+    let bindir = default_bindir(None, home);
+    let dest = format!("{}/nash", bindir.trim_end_matches('/'));
+    (bindir, dest)
 }
 
 fn bashrc_logo_block(nash_bin: &str) -> String {
@@ -190,13 +258,13 @@ fn append_etc_shells_sudo(line: &str) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
-fn register_login_shell(dest: &str, user: &str) {
+fn register_login_shell(dest: &str, user: &str) -> bool {
     let root = sys::geteuid() == 0;
     if is_android_termux() {
         if sys::find_in_path("chsh").is_some() {
-            let _ = run_cmd("chsh", &["-s", "nash"]);
+            return run_cmd("chsh", &["-s", "nash"]);
         }
-        return;
+        return false;
     }
 
     let shells = std::fs::read_to_string("/etc/shells").unwrap_or_default();
@@ -218,7 +286,7 @@ fn register_login_shell(dest: &str, user: &str) {
             println!("adding {} to /etc/shells (needs sudo)", dest);
             if !append_etc_shells_sudo(&line) {
                 eprintln!("nashed: could not update /etc/shells");
-                return;
+                return false;
             }
         } else {
             let quoted = sys::shell_quote(dest);
@@ -226,8 +294,14 @@ fn register_login_shell(dest: &str, user: &str) {
                 "nashed: /etc/shells is not writable. Run as root:\n    printf '%s\\n' {} >> /etc/shells\nthen:\n    chsh -s {}",
                 quoted, quoted
             );
-            return;
+            return false;
         }
+    }
+
+    let current = sys::get_login_shell_for(user);
+    if !current.is_empty() && same_file(&current, dest) {
+        println!("nash is already the login shell for {} ({})", user, dest);
+        return true;
     }
 
     if !sys::isatty(0) && !root {
@@ -235,19 +309,21 @@ fn register_login_shell(dest: &str, user: &str) {
             "to make nash your login shell, run:\n    chsh -s {}",
             sys::shell_quote(dest)
         );
-        return;
+        return false;
     }
 
-    let current = sys::get_login_shell();
     let ok = if sys::find_in_path("chsh").is_some() {
         if root {
             run_cmd("chsh", &["-s", dest, user])
         } else {
-            println!("changing your login shell (chsh may ask for your password)");
+            println!("changing your login shell to {} (chsh may ask for your password)", dest);
             run_cmd("chsh", &["-s", dest])
         }
     } else if root && sys::find_in_path("usermod").is_some() {
         run_cmd("usermod", &["-s", dest, user])
+    } else if sys::isatty(0) && sys::find_in_path("sudo").is_some() && sys::find_in_path("usermod").is_some() {
+        println!("changing your login shell to {} (needs sudo)", dest);
+        run_cmd("sudo", &["usermod", "-s", dest, user])
     } else {
         false
     };
@@ -256,14 +332,71 @@ fn register_login_shell(dest: &str, user: &str) {
             "nashed: could not change the login shell. Do it by hand:\n    chsh -s {}",
             sys::shell_quote(dest)
         );
-        return;
+        return false;
     }
     println!(
-        "nash is now the login shell for {} (was {})\nopen a new terminal or log in again to use it\nto go back: chsh -s {}",
+        "nash is now the login shell for {} ({}, was {})\nopen a new terminal or log in again to use it\nto go back: chsh -s {}",
         user,
+        dest,
         if current.is_empty() { "unknown" } else { &current },
         if current.is_empty() { "/bin/sh" } else { &current }
     );
+    true
+}
+
+fn warn_shadowing_nash(dest: &str) {
+    if let Some(in_path) = sys::find_in_path("nash") {
+        if !same_file(&in_path, dest) {
+            eprintln!(
+                "warning: another nash binary at {} shadows {} in your PATH",
+                in_path, dest
+            );
+        }
+    }
+}
+
+/// Keep the login shell and any existing `~/.bashrc` logo hook aligned with
+/// `dest` after `nashed update`.
+fn sync_after_nash_update(dest: &str, home: &str, user: &str, force_chsh: bool, no_chsh: bool) {
+    // If ~/.bashrc already has a managed logo hook, make sure it points to `dest`.
+    let bashrc = format!("{}/.bashrc", home.trim_end_matches('/'));
+    if let Ok(content) = std::fs::read_to_string(&bashrc) {
+        if content.contains(LOGO_START) {
+            let _ = install_bashrc_logo(home, dest);
+        }
+    }
+
+    let login_shell = sys::get_login_shell_for(user);
+    if !no_chsh {
+        if force_chsh {
+            register_login_shell(dest, user);
+        } else if is_nash_shell_path(&login_shell) && !same_file(&login_shell, dest) {
+            let old_ver = release::binary_version(&login_shell, "nash")
+                .map(|v| format!(" (nash {})", v))
+                .unwrap_or_default();
+            println!(
+                "note: your login shell is {}{}, updating login shell to {}",
+                login_shell, old_ver, dest
+            );
+            let changed = register_login_shell(dest, user);
+            if Path::new(&login_shell).exists() && !same_file(&login_shell, dest) {
+                if changed {
+                    println!(
+                        "note: an older nash binary still exists at {}; you can remove it to avoid duplicates",
+                        login_shell
+                    );
+                } else {
+                    eprintln!(
+                        "note: your login shell still points to {}; update it with `chsh -s {}' or update that binary directly",
+                        login_shell,
+                        sys::shell_quote(dest)
+                    );
+                }
+            }
+        }
+    }
+
+    warn_shadowing_nash(dest);
 }
 
 /// Download, SHA-256 verify, ELF/Mach-O inspect, smoke-test `--version`, and
@@ -441,9 +574,20 @@ fn post_install_nash(dest: &str, bindir: &str, home: &str, user: &str, add_logo:
             Err(e) => eprintln!("nashed install: could not update ~/.bashrc: {}", e),
         }
     }
+    let prev_login = sys::get_login_shell_for(user);
     if chsh {
         register_login_shell(dest, user);
     }
+    if is_nash_shell_path(&prev_login)
+        && !same_file(&prev_login, dest)
+        && Path::new(&prev_login).exists()
+    {
+        println!(
+            "note: an older nash binary still exists at {}; you can remove it to avoid duplicates",
+            prev_login
+        );
+    }
+    warn_shadowing_nash(dest);
 }
 
 pub fn cmd_install(args: &[String]) -> i32 {
@@ -482,8 +626,7 @@ pub fn cmd_install(args: &[String]) -> i32 {
     }
 
     let (user, home) = user_home();
-    let bindir = default_bindir(prefix.as_deref(), &home);
-    let dest = format!("{}/nash", bindir.trim_end_matches('/'));
+    let (bindir, dest) = choose_install_dest(prefix.as_deref(), &home, &user);
     if !sys::is_safe_shell_path(&dest) {
         eprintln!("nashed install: install path contains invalid control characters");
         return 2;
@@ -750,6 +893,8 @@ pub fn cmd_update(args: &[String]) -> i32 {
     let mut check = false;
     let mut force = false;
     let mut list = false;
+    let mut force_chsh = false;
+    let mut no_chsh = false;
     let mut prefix: Option<String> = None;
     let mut want: Option<String> = None;
     let mut i = 0;
@@ -758,6 +903,8 @@ pub fn cmd_update(args: &[String]) -> i32 {
             "--check" => check = true,
             "--force" => force = true,
             "--list" => list = true,
+            "--chsh" => force_chsh = true,
+            "--no-chsh" => no_chsh = true,
             "--prefix" => {
                 i += 1;
                 match args.get(i) {
@@ -781,8 +928,8 @@ pub fn cmd_update(args: &[String]) -> i32 {
         i += 1;
     }
 
-    let (_, home) = user_home();
-    let dest = match find_installed_nash(prefix.as_deref(), &home) {
+    let (user, home) = user_home();
+    let dest = match find_installed_nash(prefix.as_deref(), &home, &user) {
         Some(p) => p,
         None => {
             let bindir = default_bindir(prefix.as_deref(), &home);
@@ -799,7 +946,7 @@ pub fn cmd_update(args: &[String]) -> i32 {
         None
     };
 
-    update_target(
+    let code = update_target(
         "nash",
         &dest,
         current.as_deref(),
@@ -808,7 +955,11 @@ pub fn cmd_update(args: &[String]) -> i32 {
         force,
         list,
         "nashed update",
-    )
+    );
+    if code == 0 && !check && !list {
+        sync_after_nash_update(&dest, &home, &user, force_chsh, no_chsh);
+    }
+    code
 }
 
 fn cmd_update_self(args: &[String]) -> i32 {
@@ -993,6 +1144,12 @@ mod tests {
         assert!(!sys::is_safe_shell_path("/tmp/foo\n/bin/sh"));
         assert!(!sys::is_safe_shell_path("/tmp/foo\0bar"));
         assert!(!sys::is_safe_shell_path("/tmp/foo\rbar"));
+        assert!(is_nash_shell_path("/usr/local/bin/nash"));
+        assert!(is_nash_shell_path("/home/u/.local/bin/nash"));
+        assert!(!is_nash_shell_path("/bin/bash"));
+        assert!(!is_nash_shell_path("/usr/local/bin/my-nash"));
+        assert!(same_file("/usr/local/bin/nash", "/usr/local/bin/nash"));
+        assert!(!same_file("/usr/local/bin/nash", "/home/u/.local/bin/nash"));
     }
 
     #[test]

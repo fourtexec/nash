@@ -289,7 +289,7 @@ fn render_blocks(version: &str, max_cols: usize, mode: ColorMode) -> String {
         out.push('\n');
     }
 
-    let ver = format!("v{}", version);
+    let ver = format_version_label(version);
     let pad = (margin + tw).saturating_sub(ver.len()).max(margin);
     for _ in 0..pad {
         out.push(' ');
@@ -302,8 +302,16 @@ fn render_blocks(version: &str, max_cols: usize, mode: ColorMode) -> String {
     out
 }
 
+fn format_version_label(version: &str) -> String {
+    if version.as_bytes().first().map(|b| b.is_ascii_digit()).unwrap_or(false) {
+        format!("v{}", version)
+    } else {
+        version.to_string()
+    }
+}
+
 fn render_ascii(version: &str, color: bool) -> String {
-    let ver = format!("v{}", version);
+    let ver = format_version_label(version);
     if color {
         format!(
             "\n\
@@ -379,7 +387,7 @@ fn render_kitty_png(version: &str, max_cols: usize) -> String {
         pos = end;
     }
 
-    let ver = format!("v{}", version);
+    let ver = format_version_label(version);
     let pad = (2 + cols).saturating_sub(ver.len()).max(2);
     out.push('\n');
     for _ in 0..pad {
@@ -400,7 +408,7 @@ fn render_iterm2_png(version: &str, max_cols: usize) -> String {
         cols,
         b64
     );
-    let ver = format!("v{}", version);
+    let ver = format_version_label(version);
     let pad = (2 + cols).saturating_sub(ver.len()).max(2);
     for _ in 0..pad {
         out.push(' ');
@@ -622,6 +630,10 @@ mod tests {
         assert!(!a_plain.contains('\x1b'));
         assert!(a_plain.contains("___"));
         assert!(a_plain.contains("v1.0.1"));
+
+        let dev_blocks = render("dev43", true, false);
+        assert!(dev_blocks.contains("dev43"));
+        assert!(!dev_blocks.contains("vdev43"));
     }
 
     #[test]

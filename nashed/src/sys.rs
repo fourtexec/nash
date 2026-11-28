@@ -110,7 +110,40 @@ pub fn create_temp_file(dir: &str, prefix: &str, mode: u32) -> std::io::Result<(
     ))
 }
 
+fn passwd_for_name(name: &str) -> Option<(String, String)> {
+    let c = CString::new(name).ok()?;
+    unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() {
+            return None;
+        }
+        let dir = if (*pw).pw_dir.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned()
+        };
+        let shell = if (*pw).pw_shell.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
+        };
+        Some((dir, shell))
+    }
+}
+
 pub fn current_user() -> (String, Option<String>) {
+    // When invoked under `sudo`, target the invoking user rather than root so
+    // `chsh` and `~/.bashrc` apply to the user's account.
+    if geteuid() == 0 {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if !sudo_user.is_empty() && sudo_user != "root" {
+                if let Some((dir, _)) = passwd_for_name(&sudo_user) {
+                    let home = if dir.is_empty() { None } else { Some(dir) };
+                    return (sudo_user, home);
+                }
+            }
+        }
+    }
     unsafe {
         let pw = libc::getpwuid(libc::geteuid());
         if pw.is_null() {
@@ -133,8 +166,15 @@ pub fn current_user() -> (String, Option<String>) {
     }
 }
 
-/// Return the current user's configured login shell, or empty string if unknown.
-pub fn get_login_shell() -> String {
+/// Return the configured login shell for `user`, or empty string if unknown.
+pub fn get_login_shell_for(user: &str) -> String {
+    if !user.is_empty() {
+        if let Some((_, shell)) = passwd_for_name(user) {
+            if !shell.is_empty() {
+                return shell;
+            }
+        }
+    }
     unsafe {
         let pw = libc::getpwuid(libc::getuid());
         if pw.is_null() || (*pw).pw_shell.is_null() {
@@ -143,6 +183,12 @@ pub fn get_login_shell() -> String {
             CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned()
         }
     }
+}
+
+/// Return the current user's configured login shell, or empty string if unknown.
+pub fn get_login_shell() -> String {
+    let (user, _) = current_user();
+    get_login_shell_for(&user)
 }
 
 /// Safely single-quote a string for POSIX shell snippets.
